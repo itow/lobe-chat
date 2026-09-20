@@ -1,3 +1,5 @@
+import { CUSTOM_DOCUMENT_FILE_TYPE, DERIVED_DOCUMENT_SOURCE_TYPE } from '@lobechat/const';
+
 import { type FileListItem, type KnowledgeItemStatus } from '@/types/files';
 import {
   type CreateResourceParams,
@@ -21,6 +23,7 @@ const mapToResourceItem = (item: FileListItem): ResourceItem => {
     chunkingStatus: item.chunkingStatus,
     // Document-specific fields
     content: item.content,
+    contentPreview: item.contentPreview,
 
     createdAt: item.createdAt,
 
@@ -31,6 +34,8 @@ const mapToResourceItem = (item: FileListItem): ResourceItem => {
     embeddingStatus: item.embeddingStatus,
 
     embeddingTaskId: item.embeddingStatus ? 'placeholder' : null,
+
+    fileId: item.fileId,
 
     fileType: item.fileType,
 
@@ -53,8 +58,14 @@ const mapToResourceItem = (item: FileListItem): ResourceItem => {
 
     updatedAt: item.updatedAt,
 
+    uploader: item.uploader ?? null,
+
     // File-specific fields
     url: item.url,
+
+    userId: item.userId,
+
+    visibility: item.visibility,
   };
 };
 
@@ -99,6 +110,7 @@ export class ResourceService {
     // Map frontend parameter names to backend parameter names
     const backendParams = {
       ...params,
+      includeContentPreview: params.includeContentPreview ?? false,
       knowledgeBaseId: params.libraryId, // Map libraryId to knowledgeBaseId
       libraryId: undefined, // Remove the frontend-specific parameter
     };
@@ -124,9 +136,13 @@ export class ResourceService {
     return fileService.resolveKnowledgeItemIds(backendParams);
   }
 
-  async deleteResourcesByQuery(params: ResourceQueryParams): Promise<{ count: number }> {
+  async deleteResourcesByQuery(
+    params: ResourceQueryParams,
+    excludedIds?: string[],
+  ): Promise<{ count: number }> {
     const backendParams = {
       ...params,
+      excludedIds,
       knowledgeBaseId: params.libraryId,
       libraryId: undefined,
     };
@@ -196,14 +212,14 @@ export class ResourceService {
           typeof created.editorData === 'string'
             ? JSON.parse(created.editorData)
             : created.editorData,
-        fileType: created.fileType || 'custom/document',
+        fileType: created.fileType || CUSTOM_DOCUMENT_FILE_TYPE,
         id: created.id,
         metadata: created.metadata || undefined,
         name: created.title || 'Untitled',
         parentId: created.parentId,
         size: created.totalCharCount || 0,
         slug: created.slug || undefined,
-        sourceType: 'document',
+        sourceType: DERIVED_DOCUMENT_SOURCE_TYPE,
         title: created.title || undefined,
         updatedAt: created.updatedAt ? new Date(created.updatedAt) : new Date(),
         url: created.source || '',
@@ -220,34 +236,26 @@ export class ResourceService {
     if (!existing) throw new Error('Resource not found');
 
     if (existing.sourceType === 'file') {
-      // Update file (currently only supports parentId)
-      if (updates.parentId !== undefined) {
-        await fileService.updateFile(id, { parentId: updates.parentId });
-      }
-
-      // Fetch updated file
-      const updated = await fileService.getKnowledgeItem(id);
-      if (!updated) throw new Error('Failed to fetch updated file');
-
-      return mapToResourceItem(updated);
+      await fileService.updateFile(id, {
+        metadata: updates.metadata,
+        name: updates.name ?? updates.title,
+        parentId: updates.parentId !== undefined ? updates.parentId : undefined,
+      });
     } else {
-      // Update document
       await documentService.updateDocument({
         content: updates.content,
         editorData: updates.editorData ? JSON.stringify(updates.editorData) : undefined,
         id,
         metadata: updates.metadata,
-        // Keep null as null (for moving to root), don't convert to undefined
         parentId: updates.parentId !== undefined ? updates.parentId : undefined,
         title: updates.title || updates.name,
       });
-
-      // Fetch updated document
-      const updated = await fileService.getKnowledgeItem(id);
-      if (!updated) throw new Error('Failed to fetch updated document');
-
-      return mapToResourceItem(updated);
     }
+
+    const updated = await fileService.getKnowledgeItem(id);
+    if (!updated) throw new Error('Failed to fetch updated resource');
+
+    return mapToResourceItem(updated);
   }
 
   /**

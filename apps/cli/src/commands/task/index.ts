@@ -20,6 +20,7 @@ import { briefIcon, priorityLabel, statusBadge } from './helpers';
 import { registerLifecycleCommands } from './lifecycle';
 import { registerReviewCommands } from './review';
 import { registerTopicCommands } from './topic';
+import { resolveAppUrlBuilder } from './url';
 
 export function registerTaskCommand(program: Command) {
   const task = program.command('task').description('Manage agent tasks');
@@ -56,7 +57,7 @@ export function registerTaskCommand(program: Command) {
         const client = await getTrpcClient();
 
         const input: Record<string, any> = {};
-        if (options.status) input.status = options.status;
+        if (options.status) input.statuses = [options.status];
         if (options.root) input.parentTaskId = null;
         if (options.parent) input.parentTaskId = options.parent;
         if (options.agent) input.assigneeAgentId = options.agent;
@@ -296,23 +297,34 @@ export function registerTaskCommand(program: Command) {
       }
       if (t.error) console.log(`${pc.red('Error:')} ${t.error}`);
 
-      // ── Subtasks ──
+      // ── Subtasks (nested tree) ──
       if (t.subtasks && t.subtasks.length > 0) {
-        // Build lookup: which subtasks are completed
-        const completedIdentifiers = new Set(
-          t.subtasks.filter((s) => s.status === 'completed').map((s) => s.identifier),
-        );
+        // Build lookup: which subtasks are completed (flatten tree)
+        const collectCompleted = (nodes: typeof t.subtasks, set: Set<string>): Set<string> => {
+          for (const s of nodes!) {
+            if (s.status === 'completed') set.add(s.identifier);
+            if (s.children) collectCompleted(s.children, set);
+          }
+          return set;
+        };
+        const completedIdentifiers = collectCompleted(t.subtasks, new Set());
+
+        const renderSubtasks = (nodes: typeof t.subtasks, indent: string) => {
+          for (const s of nodes!) {
+            const depInfo = s.blockedBy ? pc.dim(` ← blocks: ${s.blockedBy}`) : '';
+            const isBlocked = s.blockedBy && !completedIdentifiers.has(s.blockedBy);
+            const displayStatus = s.status === 'backlog' && isBlocked ? 'blocked' : s.status;
+            console.log(
+              `${indent}${pc.dim(s.identifier)} ${statusBadge(displayStatus)} ${s.name || '(unnamed)'}${depInfo}`,
+            );
+            if (s.children && s.children.length > 0) {
+              renderSubtasks(s.children, indent + '  ');
+            }
+          }
+        };
 
         console.log(`\n${pc.bold('Subtasks:')}`);
-        for (const s of t.subtasks) {
-          const depInfo = s.blockedBy ? pc.dim(` ← blocks: ${s.blockedBy}`) : '';
-          // Show 'blocked' instead of 'backlog' if task has unresolved dependencies
-          const isBlocked = s.blockedBy && !completedIdentifiers.has(s.blockedBy);
-          const displayStatus = s.status === 'backlog' && isBlocked ? 'blocked' : s.status;
-          console.log(
-            `  ${pc.dim(s.identifier)} ${statusBadge(displayStatus)} ${s.name || '(unnamed)'}${depInfo}`,
-          );
-        }
+        renderSubtasks(t.subtasks, '  ');
       }
 
       // ── Dependencies ──
@@ -455,7 +467,12 @@ export function registerTaskCommand(program: Command) {
                   : act.priority === 'normal'
                     ? pc.yellow(' [normal]')
                     : '';
-              const resolved = act.resolvedAction ? pc.green(` ✏️ ${act.resolvedAction}`) : '';
+              const resolvedLabel = act.resolvedAction
+                ? act.resolvedComment
+                  ? `${act.resolvedAction}: ${act.resolvedComment}`
+                  : act.resolvedAction
+                : '';
+              const resolved = resolvedLabel ? pc.green(` ✏️ ${resolvedLabel}`) : '';
               const typeLabel = pc.dim(`[${act.briefType}]`);
               console.log(
                 `  ${icon} ${pc.dim(ago.padStart(7))} Brief ${typeLabel} ${act.title}${pri}${resolved}${idSuffix}`,
@@ -463,6 +480,32 @@ export function registerTaskCommand(program: Command) {
             } else if (act.type === 'comment') {
               const author = act.agentId ? `🤖 ${act.agentId}` : '👤 user';
               console.log(`  💭 ${pc.dim(ago.padStart(7))} ${pc.cyan(author)} ${act.content}`);
+            } else if (act.type === 'property') {
+              const actor = act.author ? act.author.name || act.author.id : 'system';
+              const change = act.propertyChange;
+              const show = (v: unknown) =>
+                v && typeof v === 'object' ? JSON.stringify(v) : String(v ?? 'none');
+              console.log(
+                `  🔁 ${pc.dim(ago.padStart(7))} ${pc.cyan(actor)} changed ${change?.field}: ${show(change?.from)} → ${show(change?.to)}${idSuffix}`,
+              );
+            } else if (act.type === 'assignment') {
+              // Same three-state naming as `assignmentParticipantLabel` in
+              // @lobechat/prompts; inlined rather than adding a package
+              // dependency for three lines.
+              const label = (
+                party?: { id: string; name?: string | null; unresolved?: boolean } | null,
+                absent = 'unassigned',
+              ) =>
+                party
+                  ? party.name ||
+                    party.id ||
+                    (party.unresolved ? 'a deleted participant' : 'unnamed')
+                  : absent;
+              const slot = act.assignment?.kind === 'agent' ? 'agent' : 'member';
+              const actor = label(act.author, 'system');
+              console.log(
+                `  👥 ${pc.dim(ago.padStart(7))} ${pc.cyan(actor)} set ${slot} assignee: ${label(act.assignment?.from)} → ${label(act.assignment?.to)}${idSuffix}`,
+              );
             }
           }
         }
@@ -494,6 +537,7 @@ export function registerTaskCommand(program: Command) {
         priority?: string;
       }) => {
         const client = await getTrpcClient();
+        const buildUrl = await resolveAppUrlBuilder(client);
 
         const input: Record<string, any> = {
           instruction: options.instruction,
@@ -505,13 +549,15 @@ export function registerTaskCommand(program: Command) {
         if (options.prefix) input.identifierPrefix = options.prefix;
 
         const result = await client.task.create.mutate(input as any);
+        const url = buildUrl(`/task/${encodeURIComponent(result.data.identifier)}`);
 
         if (options.json !== undefined) {
-          outputJson(result.data, options.json);
+          outputJson({ ...result.data, url }, options.json);
           return;
         }
 
         log.info(`Task created: ${pc.bold(result.data.identifier)} ${result.data.name || ''}`);
+        console.log(`${pc.bold('task')}: ${url}`);
       },
     );
 
@@ -549,18 +595,6 @@ export function registerTaskCommand(program: Command) {
       ) => {
         const client = await getTrpcClient();
 
-        // Handle --status separately (uses updateStatus API)
-        if (options.status) {
-          const valid = ['backlog', 'running', 'paused', 'completed', 'failed', 'canceled'];
-          if (!valid.includes(options.status)) {
-            log.error(`Invalid status "${options.status}". Must be one of: ${valid.join(', ')}`);
-            return;
-          }
-          const result = await client.task.updateStatus.mutate({ id, status: options.status });
-          log.info(`${pc.bold(result.data.identifier)} → ${options.status}`);
-          return;
-        }
-
         const input: Record<string, any> = { id };
         if (options.name) input.name = options.name;
         if (options.instruction) input.instruction = options.instruction;
@@ -573,6 +607,25 @@ export function registerTaskCommand(program: Command) {
           const val = Number.parseInt(options.heartbeatTimeout, 10);
           input.heartbeatTimeout = val === 0 ? null : val;
         }
+        const hasFieldEdits = Object.keys(input).length > 1;
+
+        // Status-only edits use the lifecycle API. Combined edits go through
+        // task.update so the server can apply the fields and lifecycle change
+        // atomically.
+        if (options.status) {
+          const valid = ['backlog', 'running', 'paused', 'completed', 'failed', 'canceled'];
+          if (!valid.includes(options.status)) {
+            log.error(`Invalid status "${options.status}". Must be one of: ${valid.join(', ')}`);
+            return;
+          }
+          if (!hasFieldEdits) {
+            const result = await client.task.updateStatus.mutate({ id, status: options.status });
+            log.info(`${pc.bold(result.data.identifier)} → ${options.status}`);
+            return;
+          }
+
+          input.status = options.status;
+        }
 
         const result = await client.task.update.mutate(input as any);
 
@@ -581,7 +634,8 @@ export function registerTaskCommand(program: Command) {
           return;
         }
 
-        log.info(`Task updated: ${pc.bold(result.data.identifier)}`);
+        const statusSuffix = options.status ? ` → ${options.status}` : '';
+        log.info(`Task updated: ${pc.bold(result.data.identifier)}${statusSuffix}`);
       },
     );
 

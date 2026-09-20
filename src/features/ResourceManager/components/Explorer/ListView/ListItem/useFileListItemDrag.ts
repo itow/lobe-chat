@@ -5,7 +5,8 @@ import {
   getTransparentDragImage,
   useDragActive,
   useSetCurrentDrag,
-} from '@/routes/(main)/resource/features/DndContextWrapper';
+} from '@/features/ResourceManager/DndContextWrapper';
+import { useFileStore } from '@/store/file';
 
 interface UseFileListItemDragOptions {
   fileType?: string | null;
@@ -48,9 +49,11 @@ export const useFileListItemDrag = ({
       }
 
       setIsDragging(true);
+      const parentKey = useFileStore.getState().queryParams?.parentId ?? '';
       setCurrentDrag({
         data: dragData,
         id,
+        parentKey,
         type: isFolder ? 'folder' : 'file',
       });
 

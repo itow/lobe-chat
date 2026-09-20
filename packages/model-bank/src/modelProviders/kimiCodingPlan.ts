@@ -1,9 +1,9 @@
-import type { ModelProviderCard } from '@/types/llm';
+import type { ModelProviderCard } from '../types';
 
 // ref: https://platform.moonshot.ai/docs
 const KimiCodingPlan: ModelProviderCard = {
   chatModels: [],
-  checkModel: 'k2p5',
+  checkModel: 'kimi-k2.5',
   description:
     'Kimi Code from Moonshot AI provides access to Kimi models including K2.5 for coding tasks.',
   disableBrowserRequest: true,

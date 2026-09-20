@@ -4,14 +4,6 @@ import type { App } from '@/core/App';
 
 import UpdaterCtr from '../UpdaterCtr';
 
-// 模拟 logger
-vi.mock('@/utils/logger', () => ({
-  createLogger: () => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-  }),
-}));
-
 vi.mock('@/modules/updater/configs', () => ({
   UPDATE_CHANNEL: 'stable',
 }));
@@ -26,17 +18,21 @@ vi.mock('electron', () => ({
   },
 }));
 
-// 模拟 App 及其依赖项
+// Mock App and its dependencies
 const mockCheckForUpdates = vi.fn();
 const mockDownloadUpdate = vi.fn();
 const mockInstallNow = vi.fn();
 const mockInstallLater = vi.fn();
 const mockGetUpdaterState = vi.fn();
+const mockRendererSwitchChannel = vi.fn();
 const mockSwitchChannel = vi.fn();
 const mockStoreGet = vi.fn();
 const mockStoreSet = vi.fn();
 
 const mockApp = {
+  rendererUpdateManager: {
+    switchChannel: mockRendererSwitchChannel,
+  },
   storeManager: {
     get: mockStoreGet,
     set: mockStoreSet,
@@ -77,15 +73,15 @@ describe('UpdaterCtr', () => {
   });
 
   describe('quitAndInstallUpdate', () => {
-    it('should call updaterManager.installNow', () => {
-      updaterCtr.quitAndInstallUpdate();
+    it('should call updaterManager.installNow', async () => {
+      await updaterCtr.quitAndInstallUpdate();
       expect(mockInstallNow).toHaveBeenCalled();
     });
   });
 
   describe('installLater', () => {
-    it('should call updaterManager.installLater', () => {
-      updaterCtr.installLater();
+    it('should call updaterManager.installLater', async () => {
+      await updaterCtr.installLater();
       expect(mockInstallLater).toHaveBeenCalled();
     });
   });
@@ -107,6 +103,7 @@ describe('UpdaterCtr', () => {
       await updaterCtr.setUpdateChannel('canary');
 
       expect(mockStoreSet).toHaveBeenCalledWith('updateChannel', 'canary');
+      expect(mockRendererSwitchChannel).toHaveBeenCalledWith('canary');
       expect(mockSwitchChannel).toHaveBeenCalledWith('canary');
     });
 
@@ -116,17 +113,18 @@ describe('UpdaterCtr', () => {
       );
 
       expect(mockStoreSet).not.toHaveBeenCalled();
+      expect(mockRendererSwitchChannel).not.toHaveBeenCalled();
       expect(mockSwitchChannel).not.toHaveBeenCalled();
     });
   });
 
-  // 测试错误处理
+  // Test error handling
   describe('error handling', () => {
     it('should handle errors when checking for updates', async () => {
       const error = new Error('Network error');
       mockCheckForUpdates.mockRejectedValueOnce(error);
 
-      // 由于控制器并未明确处理并返回错误，这里我们只验证调用发生且错误正确冒泡
+      // Since the controller does not explicitly handle and return errors, we only verify that the call occurs and the error propagates correctly
       await expect(updaterCtr.checkForUpdates()).rejects.toThrow(error);
     });
 

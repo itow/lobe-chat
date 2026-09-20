@@ -1,33 +1,50 @@
-import { memo, useState } from 'react';
+import { memo } from 'react';
 
 import Intervention from '../Messages/AssistantGroup/Tool/Detail/Intervention';
 import { type PendingIntervention } from '../store/slices/data/pendingInterventions';
-import { useStyles } from './style';
+import { styles } from './style';
+import UserInterventionErrorBoundary from './UserInterventionErrorBoundary';
 
 interface InterventionContentProps {
+  actionsPortalTarget: HTMLDivElement | null;
   intervention: PendingIntervention;
 }
 
-const InterventionContent = memo<InterventionContentProps>(({ intervention }) => {
-  const { styles } = useStyles();
-  const [actionsContainer, setActionsContainer] = useState<HTMLDivElement | null>(null);
+const InterventionContent = memo<InterventionContentProps>(
+  ({ intervention, actionsPortalTarget }) => {
+    const boundaryKey = [
+      intervention.apiName,
+      intervention.identifier,
+      intervention.requestArgs,
+      intervention.toolCallId,
+      intervention.toolMessageId,
+    ].join('|');
 
-  return (
-    <>
+    return (
       <div className={styles.content}>
-        <Intervention
-          actionsPortalTarget={actionsContainer}
+        <UserInterventionErrorBoundary
+          actionsPortalTarget={actionsPortalTarget}
           apiName={intervention.apiName}
           assistantGroupId={intervention.assistantGroupId}
-          id={intervention.toolMessageId}
           identifier={intervention.identifier}
+          key={boundaryKey}
           requestArgs={intervention.requestArgs}
           toolCallId={intervention.toolCallId}
-        />
+          toolMessageId={intervention.toolMessageId}
+        >
+          <Intervention
+            actionsPortalTarget={actionsPortalTarget}
+            apiName={intervention.apiName}
+            assistantGroupId={intervention.assistantGroupId}
+            id={intervention.toolMessageId}
+            identifier={intervention.identifier}
+            requestArgs={intervention.requestArgs}
+            toolCallId={intervention.toolCallId}
+          />
+        </UserInterventionErrorBoundary>
       </div>
-      <div className={styles.actions} ref={setActionsContainer} />
-    </>
-  );
-});
+    );
+  },
+);
 
 export default InterventionContent;

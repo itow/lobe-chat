@@ -21,17 +21,11 @@ const FORBID_EVENT_HANDLERS = [
 ];
 
 /**
- * Sanitizes HTML content to prevent XSS attacks while preserving safe HTML elements
- * @param content - The HTML content to sanitize
- * @returns Sanitized HTML content safe for rendering
+ * Matches any `on*` event-handler attribute together with its value — ` onclick="…"`,
+ * ` onload='…'`, or unquoted ` onfoo=bar`. SVG has no safe attribute that starts with `on`,
+ * so stripping all of them is lossless for legitimate content.
  */
-export const sanitizeHTMLContent = (content: string): string => {
-  return DOMPurify.sanitize(content, {
-    FORBID_ATTR: FORBID_EVENT_HANDLERS,
-    FORBID_TAGS: ['embed', 'link', 'meta', 'object', 'script'],
-    KEEP_CONTENT: true,
-  });
-};
+const EVENT_HANDLER_ATTR = /\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s/>]+)/gi;
 
 /**
  * Sanitizes SVG content to prevent XSS attacks while preserving safe SVG elements and attributes
@@ -39,10 +33,27 @@ export const sanitizeHTMLContent = (content: string): string => {
  * @returns Sanitized SVG content safe for rendering
  */
 export const sanitizeSVGContent = (content: string): string => {
-  return DOMPurify.sanitize(content, {
+  const sanitized = DOMPurify.sanitize(content, {
     FORBID_ATTR: FORBID_EVENT_HANDLERS,
     FORBID_TAGS: ['embed', 'link', 'object', 'script', 'style'],
     KEEP_CONTENT: false,
     USE_PROFILES: { svg: true, svgFilters: true },
   });
+
+  // Defense-in-depth: DOMPurify's attribute-level filtering runs through the underlying DOM's
+  // attribute + namespace handling, which is inconsistent across engines (jsdom vs happy-dom) and
+  // DOMPurify versions — in some CI environments `on*` handlers on SVG-namespaced nodes are not
+  // stripped at all. Scrub them from the serialized output so removal is deterministic everywhere.
+  //
+  // Apply repeatedly until the string stabilizes: removing one handler can splice the surrounding
+  // text into a fresh `on…=` token (e.g. ` on onclick="x"click="y"` → ` onclick="y"`), which a
+  // single pass would miss.
+  let scrubbed = sanitized;
+  let previous: string;
+  do {
+    previous = scrubbed;
+    scrubbed = scrubbed.replaceAll(EVENT_HANDLER_ATTR, '');
+  } while (scrubbed !== previous);
+
+  return scrubbed;
 };
