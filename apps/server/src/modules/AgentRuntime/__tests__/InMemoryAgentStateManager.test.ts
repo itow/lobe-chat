@@ -45,6 +45,14 @@ describe('InMemoryAgentStateManager', () => {
       expect(typeof meta!.lastActiveAt).toBe('string');
     });
 
+    it('stores the client member_runtime_end declaration', async () => {
+      await manager.createOperationMetadata('op-member-end', { acceptsMemberRuntimeEnd: true });
+
+      expect((await manager.getOperationMetadata('op-member-end'))!.acceptsMemberRuntimeEnd).toBe(
+        true,
+      );
+    });
+
     it('should store provided userId, agentConfig and modelRuntimeConfig', async () => {
       await manager.createOperationMetadata('op-2', {
         agentConfig: { maxSteps: 10 },
@@ -117,7 +125,7 @@ describe('InMemoryAgentStateManager', () => {
 
     it('should update metadata.status and totalCost when state is saved (with existing metadata)', async () => {
       await manager.createOperationMetadata('op-c', {});
-      const state = makeState({ status: 'done', stepCount: 5, cost: { total: 200 } });
+      const state = makeState({ status: 'done', stepCount: 5, llmCalls: 5, cost: { total: 200 } });
       await manager.saveAgentState('op-c', state);
 
       const meta = await manager.getOperationMetadata('op-c');
@@ -194,7 +202,7 @@ describe('InMemoryAgentStateManager', () => {
     it('should update metadata after saving step result', async () => {
       await manager.createOperationMetadata('op-meta-update', {});
       const stepResult = makeStepResult({
-        newState: makeState({ status: 'done', stepCount: 7, cost: { total: 300 } }),
+        newState: makeState({ status: 'done', stepCount: 7, llmCalls: 7, cost: { total: 300 } }),
         stepIndex: 7,
       });
 
@@ -294,6 +302,25 @@ describe('InMemoryAgentStateManager', () => {
       await manager.deleteAgentOperation('op-int');
 
       expect(await manager.isInterrupted('op-int')).toBe(false);
+    });
+  });
+
+  describe('queued messages flag', () => {
+    it('should follow the latest setQueuedMessages value', async () => {
+      expect(await manager.hasQueuedMessages('op-q')).toBe(false);
+
+      await manager.setQueuedMessages('op-q', true);
+      expect(await manager.hasQueuedMessages('op-q')).toBe(true);
+
+      await manager.setQueuedMessages('op-q', false);
+      expect(await manager.hasQueuedMessages('op-q')).toBe(false);
+    });
+
+    it('should clear the flag when the operation is deleted', async () => {
+      await manager.setQueuedMessages('op-q', true);
+      await manager.deleteAgentOperation('op-q');
+
+      expect(await manager.hasQueuedMessages('op-q')).toBe(false);
     });
   });
 

@@ -1,9 +1,10 @@
 import {
   buildClaudeCodeDirectEnv,
+  CLAUDE_CODE_BASE_ARGS,
+  prepareClaudeCodeLobeHubCli,
   sanitizeClaudeCodeDirectArgs,
   sanitizeClaudeCodeDirectEnv,
-} from '@lobechat/heterogeneous-agents';
-import { CLAUDE_CODE_BASE_ARGS } from '@lobechat/heterogeneous-agents/spawn';
+} from '@lobechat/heterogeneous-agents/spawn';
 import { formatServerDefaultHeterogeneousModel } from '@lobechat/types';
 
 import type { HeterogeneousAgentBuildPlanParams, HeterogeneousAgentDriver } from '../types';
@@ -22,12 +23,18 @@ const DESKTOP_CLAUDE_CODE_ARGS = [
 export const claudeCodeDriver: HeterogeneousAgentDriver = {
   async buildSpawnPlan({
     args,
+    cliVersion,
     helpers,
     mcpConfigPath,
     promptInput,
     resumeSessionId,
   }: HeterogeneousAgentBuildPlanParams) {
-    const { stdin: stdinPayload } = await helpers.buildAgentInput('claude-code', promptInput);
+    // The `lh` guide rides along as a skill, not as text in the user's turn.
+    const lobeHubCli = await prepareClaudeCodeLobeHubCli(promptInput, args, {
+      resumed: Boolean(resumeSessionId),
+      version: cliVersion,
+    });
+    const { stdin: stdinPayload } = await helpers.buildAgentInput('claude-code', lobeHubCli.prompt);
 
     return {
       args: [
@@ -37,8 +44,17 @@ export const claudeCodeDriver: HeterogeneousAgentDriver = {
         // does not accept inline JSON for `--mcp-config`.
         ...(mcpConfigPath ? ['--mcp-config', mcpConfigPath] : []),
         ...(resumeSessionId ? ['--resume', resumeSessionId] : []),
+        // Input stays open (see `liveInput` below), and a live session replays
+        // each message it reads: how a delivered message is known to be picked up.
+        '--replay-user-messages',
+        ...lobeHubCli.args,
         ...args,
       ],
+      // Like `lh hetero exec`, Claude Code always keeps its input open: it is
+      // the control channel (stop one background task, deliver a steer) and
+      // what keeps background tasks alive past the turn. Whether queued
+      // messages are written mid-run is the Follow-up mode's call, not this.
+      liveInput: true,
       stdinPayload,
     };
   },

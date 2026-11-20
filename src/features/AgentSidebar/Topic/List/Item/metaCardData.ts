@@ -7,7 +7,7 @@ import {
   getTopicMetadataWorkingDirectoryEffectivePath,
   getTopicMetadataWorkingDirectorySourcePath,
 } from '@lobechat/utils/client/topic';
-import { cssVar } from 'antd-style';
+import { cssVar } from '@lobehub/ui';
 import type { LucideIcon } from 'lucide-react';
 import {
   CircleCheck,
@@ -31,7 +31,9 @@ export type PullRequestState = 'open' | 'merged' | 'closed';
  * Resolve a GitHub PR's lifecycle state. GitHub's `state` is only open|closed;
  * "merged" is a closed PR carrying a `mergedAt`, so check that first.
  */
-export const getPullRequestState = (pr: DeviceGitLinkedPullRequest): PullRequestState => {
+export const getPullRequestState = (
+  pr: Pick<DeviceGitLinkedPullRequest, 'mergedAt' | 'state'>,
+): PullRequestState => {
   if (pr.mergedAt || pr.state === 'merged') return 'merged';
   if (pr.state === 'closed') return 'closed';
   return 'open';
@@ -39,7 +41,7 @@ export const getPullRequestState = (pr: DeviceGitLinkedPullRequest): PullRequest
 
 // GitHub merged-PR purple. Kept as a constant since antd's token set has no
 // semantic "merged" color; the green (success) / red (error) come from tokens.
-const MERGED_PURPLE = '#8957e5';
+export const MERGED_PURPLE = '#8957e5';
 
 export interface PullRequestStateVisual {
   color: string;
@@ -82,7 +84,14 @@ export const getCiVisual = (status?: DeviceGitPullRequestCiStatus): CiVisual => 
  * `workingDirectoryConfig`. Returns `undefined` when the topic carries no git
  * context, so the caller can skip the hover card entirely (no probe).
  */
-export const getTopicMetaCard = (metadata: ChatTopicMetadata | undefined) => {
+export const getTopicMetaCard = (
+  metadata: ChatTopicMetadata | undefined,
+  /**
+   * Better Coding Experience: the recorded PR is a branch guess, which the lab
+   * no longer shows — a topic's PRs come from its Work rows instead.
+   */
+  options: { hideRecordedPullRequest?: boolean } = {},
+) => {
   const config = metadata?.workingDirectoryConfig;
   const git = config?.git;
   if (!git) return undefined;
@@ -94,7 +103,9 @@ export const getTopicMetaCard = (metadata: ChatTopicMetadata | undefined) => {
   return {
     branch: git.branch,
     detached: git.detached,
-    pullRequest: git.github?.pullRequest ?? undefined,
+    pullRequest: options.hideRecordedPullRequest
+      ? undefined
+      : (git.github?.pullRequest ?? undefined),
     repoName: sourcePath ? getWorkingDirectoryName(sourcePath) : undefined,
     repoType: getConfigRepoType(config),
     worktreeName: isWorktree && effectivePath ? getWorkingDirectoryName(effectivePath) : undefined,

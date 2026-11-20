@@ -1,4 +1,5 @@
 import { isDesktop } from '@lobechat/const';
+import { type FollowUpMode, resolveFollowUpMode } from '@lobechat/types';
 
 import { DEFAULT_LANG } from '@/const/locale';
 import { type Locales, normalizeLocale } from '@/locales/resources';
@@ -32,11 +33,34 @@ const currentResponseLanguage = (s: UserStore): Locales => {
   return normalizeLocale(getSystemLanguage());
 };
 const telemetry = (s: UserStore) => generalConfig(s).telemetry;
+const timezone = (s: UserStore) => generalConfig(s).timezone;
+/** The user's timezone setting, falling back to the browser's. */
+const currentTimezone = (s: UserStore): string | undefined =>
+  timezone(s) ||
+  (typeof Intl === 'undefined' ? undefined : Intl.DateTimeFormat().resolvedOptions().timeZone);
 const enableAutoScrollOnStreaming = (s: UserStore) =>
   generalConfig(s).enableAutoScrollOnStreaming ?? true;
 const enableMessageLinkIcon = (s: UserStore) => generalConfig(s).enableMessageLinkIcon ?? true;
+// Users who switched off the retired `enableInputMarkdown` lab did so to keep pasted text verbatim.
+const enablePasteAutoConvert = (s: UserStore) =>
+  generalConfig(s).enablePasteAutoConvert ?? s.preference.lab?.enableInputMarkdown !== false;
+const showImageReadPreview = (s: UserStore) => generalConfig(s).showImageReadPreview ?? true;
+const fontAntialiasing = (s: UserStore) => generalConfig(s).fontAntialiasing ?? true;
+/** The setting is a boolean: either the live tool list is open or it is a
+ *  summary row. "Open" means the full list — the height-capped middle level
+ *  just hid part of what the user asked to see. */
 const workflowStreamingExpandLevel = (s: UserStore) =>
-  generalConfig(s).expandWorkflowWhileStreaming ? 'semi' : 'collapsed';
+  generalConfig(s).expandWorkflowWhileStreaming ? 'full' : 'collapsed';
+
+/**
+ * What a message sent during a run does. `legacy` (lab off) keeps the
+ * behavior from before the setting existed; the setting defaults to steer.
+ */
+const followUpBehavior = (s: UserStore): FollowUpMode =>
+  resolveFollowUpMode(
+    s.preference.lab?.enableBetterCodingExperience,
+    generalConfig(s).followUpBehavior,
+  );
 
 export const userGeneralSettingsSelectors = {
   animationMode,
@@ -44,14 +68,20 @@ export const userGeneralSettingsSelectors = {
   contextMenuMode,
   enableAutoScrollOnStreaming,
   enableMessageLinkIcon,
+  enablePasteAutoConvert,
+  followUpBehavior,
+  fontAntialiasing,
   fontSize,
   highlighterTheme,
   mermaidTheme,
   neutralColor,
   primaryColor,
   currentResponseLanguage,
+  currentTimezone,
   responseLanguage,
+  showImageReadPreview,
   telemetry,
+  timezone,
   transitionMode,
   workflowStreamingExpandLevel,
 };

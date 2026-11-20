@@ -132,22 +132,29 @@ const buildOpenCodeInput = async (
   };
 };
 
-const buildPiInput = async (
+const buildPiInput = async (): Promise<AgentInputPlan> => {
+  // pi runs exclusively over the RPC transport (PiRpcSession /
+  // createPiRpcAgentHandle) — the legacy `--mode json` stdin input is gone.
+  throw new Error(
+    'pi runs over the RPC transport only — use PiRpcSession / createPiRpcAgentHandle',
+  );
+};
+
+const buildKimiCodeInput = async (
   blocks: AgentContentBlock[],
   options: BuildAgentInputOptions,
 ): Promise<AgentInputPlan> => {
   const imagePaths = await resolvePathInputImagePaths(blocks, options);
-  return {
-    args: imagePaths.map((imagePath) => `@${imagePath}`),
-    stdin: collectText(blocks),
-  };
-};
+  const text = collectText(blocks);
 
-const buildKimiCodeInput = (blocks: AgentContentBlock[]): AgentInputPlan => {
-  if (blocks.some(isImageBlock)) {
-    throw new Error('Kimi Code does not support image attachments in one-shot prompt mode.');
-  }
-  return { args: ['--prompt', collectText(blocks)], stdin: '' };
+  // One-shot `--prompt` mode has no attachment flag, but the model reads local
+  // images via its builtin ReadMediaFile tool when the prompt references a path.
+  const imageSection = imagePaths
+    .map((p) => `[Image attached: ${p}] Use the ReadMediaFile tool to view this image.`)
+    .join('\n');
+  const prompt = [text, imageSection].filter(Boolean).join('\n\n');
+
+  return { args: ['--prompt', prompt], stdin: '' };
 };
 
 const buildQoderInput = async (
@@ -177,6 +184,7 @@ const buildQoderInput = async (
  *
  * - `amp` / `claude-code` / `codebuddy`: stream-json on stdin with text + base64 image content blocks
  * - `codex`: raw text on stdin + repeatable `--image <path>` flags
+ * - `kimi-code`: `--prompt <text>` with materialized image paths referenced in the text
  * - `opencode`: raw text on stdin + repeatable `--file <path>` flags
  * - `pi`: raw text on stdin + repeatable `@<path>` arguments
  * - `qoder`: stream-json text on stdin + repeatable `--attachment <path>` flags
@@ -192,6 +200,17 @@ export const buildAgentInput = async (
   const blocks = toBlocks(prompt);
 
   switch (agentType) {
+    case 'antigravity': {
+      // agy's stream input currently accepts text only. Never silently discard
+      // attachments or send unsupported blocks that terminate its session.
+      if (blocks.some(isImageBlock)) {
+        throw new Error('Antigravity CLI stream input does not support image attachments.');
+      }
+      return {
+        args: [],
+        stdin: `${JSON.stringify({ event: 'user', message: { content: collectText(blocks) } })}\n`,
+      };
+    }
     case 'amp':
     case 'claude-code':
     case 'codebuddy': {
@@ -201,13 +220,13 @@ export const buildAgentInput = async (
       return buildCodexInput(blocks, options);
     }
     case 'kimi-code': {
-      return buildKimiCodeInput(blocks);
+      return buildKimiCodeInput(blocks, options);
     }
     case 'opencode': {
       return buildOpenCodeInput(blocks, options);
     }
     case 'pi': {
-      return buildPiInput(blocks, options);
+      return buildPiInput();
     }
     case 'qoder': {
       return buildQoderInput(blocks, options);

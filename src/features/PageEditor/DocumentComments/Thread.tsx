@@ -1,28 +1,21 @@
 import type { DocumentCommentItem, DocumentCommentThread } from '@lobechat/types';
-import { Center, Flexbox } from '@lobehub/ui';
-import { Button } from '@lobehub/ui/base-ui';
+import { Button, Center, cx, Flexbox, Skeleton } from '@lobehub/ui';
 import { Fragment, memo, useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import AsyncError from '@/components/AsyncError';
-import SurfaceSkeleton from '@/components/Skeleton/Surface';
-import { documentCommentService } from '@/services/documentComment';
+import { documentCommentActions } from '@/store/documentComment';
 
 import CommentCard from './CommentCard';
 import Composer from './Composer';
 import {
+  handleDocumentCommentUpdate,
   useDocumentCommentDetail,
   useDocumentCommentReplies,
   useOptimisticDocumentComment,
 } from './hooks';
-import type { DocumentCommentSubmitInput, DocumentCommentUpdateHandler } from './optimistic';
-import {
-  appendOptimisticReply,
-  isOptimisticDocumentComment,
-  removeOptimisticReply,
-  replaceOptimisticReply,
-  replaceReplyComment,
-} from './optimistic';
+import type { DocumentCommentSubmitInput } from './optimistic';
+import { isOptimisticDocumentComment } from './optimistic';
 import { styles } from './styles';
 import { useAutoLoadReplies } from './useAutoLoadReplies';
 import type {
@@ -31,64 +24,74 @@ import type {
 } from './useDocumentCommentDeepLink';
 
 interface ThreadProps extends DocumentCommentThread {
+  /** Narrow-column layout for a thread in the gutter. */
+  compact?: boolean;
   documentId: string;
   /** Deep-link target inside this thread; forces replies to load and highlights the card. */
   focus?: DocumentCommentFocus;
   /** The deep-linked reply is gone from this thread ('missing') or could not be loaded ('failed'). */
   onFocusMissing?: (reason: DocumentCommentFocusMissReason) => void;
   onMutated: () => void | Promise<void>;
-  onReplyCountChange: (rootCommentId: string, delta: number) => void | Promise<unknown>;
-  onRootUpdate: DocumentCommentUpdateHandler;
-  onSummaryChange: (delta: number) => void | Promise<unknown>;
 }
 
+/** At most this many placeholder rows while a thread's replies load. */
+const REPLY_SKELETON_MAX = 3;
+
+/**
+ * Placeholder rows shaped like the replies they stand in for — one per
+ * expected reply, capped — rather than a generic five-card list that towers
+ * over a thread with a single answer.
+ */
+const ReplySkeleton = memo<{ compact: boolean; count: number }>(({ compact, count }) => (
+  <Flexbox gap={compact ? 12 : 16} paddingBlock={compact ? 4 : 8}>
+    {Array.from({ length: Math.min(Math.max(count, 1), REPLY_SKELETON_MAX) }).map((_, index) => (
+      <Flexbox gap={8} key={index}>
+        <Flexbox horizontal align={'center'} gap={8}>
+          <Skeleton height={28} radius={14} width={28} />
+          <Skeleton height={14} width={96 + (index % 2) * 24} />
+        </Flexbox>
+        <Skeleton height={14} width={`${48 + (index % 3) * 14}%`} />
+      </Flexbox>
+    ))}
+  </Flexbox>
+));
+
+ReplySkeleton.displayName = 'DocumentCommentReplySkeleton';
+
 const Thread = memo<ThreadProps>(
-  ({
-    documentId,
-    focus,
-    onFocusMissing,
-    onMutated,
-    onReplyCountChange,
-    onRootUpdate,
-    onSummaryChange,
-    replyCount,
-    root,
-  }) => {
+  ({ compact = false, documentId, focus, onFocusMissing, onMutated, replyCount, root }) => {
     const { t } = useTranslation('file');
     const [replyTargetId, setReplyTargetId] = useState<string | null>(null);
     const { containerRef, shouldLoad } = useAutoLoadReplies(replyCount > 0);
     const focusedReplyId = focus && focus.commentId !== root.id ? focus.commentId : undefined;
-    const replies = useDocumentCommentReplies(
-      root.id,
-      shouldLoad || Boolean(replyTargetId) || Boolean(focusedReplyId),
-    );
+    // Once the replies have been asked for they stay subscribed. Closing the
+    // reply box after sending would otherwise drop the key for a render or
+    // two (until the auto-load observer catches up), which empties the list,
+    // discards the optimistic reply on screen, and brings the skeleton back
+    // while the server page is refetched.
+    const wantsReplies = shouldLoad || Boolean(replyTargetId) || Boolean(focusedReplyId);
+    const [repliesLatched, setRepliesLatched] = useState(wantsReplies);
+    useEffect(() => {
+      if (wantsReplies) setRepliesLatched(true);
+    }, [wantsReplies]);
+    const replies = useDocumentCommentReplies(root.id, wantsReplies || repliesLatched);
     const createOptimistic = useOptimisticDocumentComment();
-    const mutateReplies = replies.mutate;
     const reloadReplies = replies.reload;
     // The linked reply is fetched by id and shown first until it appears on a loaded page
-    // (replies are oldest-first). It lives in its own cache entry, so thread refreshes
+    // (replies are oldest-first). It lives in its own replica entry, so thread refreshes
     // revalidate it too — a deleted pinned reply must not linger.
     const hasFocusedReply =
       Boolean(focusedReplyId) && replies.items.some((item) => item.id === focusedReplyId);
     const focusedReply = useDocumentCommentDetail(hasFocusedReply ? undefined : focusedReplyId);
-    const mutateFocusedReply = focusedReply.mutate;
+    const pinnedReplyId = hasFocusedReply ? undefined : focusedReplyId;
     const refreshThread = useCallback(async () => {
       // A post-delete 404 on the detail entry flows through `isNotFound`; it is not a failure.
       await Promise.all([
         reloadReplies(),
-        mutateFocusedReply().catch(() => undefined),
+        pinnedReplyId ? documentCommentActions.revalidateDetail(pinnedReplyId) : undefined,
         onMutated(),
       ]);
-    }, [mutateFocusedReply, onMutated, reloadReplies]);
-    // Reply edits patch the paginated cache; mirror them into the pinned detail entry too.
-    const patchFocusedReply = useCallback(
-      (next: DocumentCommentItem) =>
-        mutateFocusedReply(
-          (current) => (current && current.id === next.id ? { ...current, ...next } : current),
-          { revalidate: false },
-        ),
-      [mutateFocusedReply],
-    );
+    }, [onMutated, pinnedReplyId, reloadReplies]);
     // The deep-link target while it is not on a loaded page. It renders on its own, so a
     // pending or failed page request never hides a reply that was already fetched.
     const pinnedReply = useMemo(() => {
@@ -121,94 +124,20 @@ const Thread = memo<ThreadProps>(
           replyTo:
             replyTarget.id === root.id ? null : { author: replyTarget.author, id: replyTarget.id },
         });
-        await Promise.all([
-          mutateReplies((pages) => appendOptimisticReply(pages, optimisticComment), {
-            revalidate: false,
-          }),
-          onReplyCountChange(root.id, 1),
-          onSummaryChange(1),
-        ]);
-
-        let created: Awaited<ReturnType<typeof documentCommentService.create>>;
-        try {
-          created = await documentCommentService.create({
+        // A duplicate (retried) submit re-reads the thread inside the store.
+        await documentCommentActions.createReply({
+          input: {
             clientId,
             content,
             documentId: replyTarget.documentId,
             editorData,
             parentCommentId: replyTarget.id,
-          });
-          if (!created) throw new Error('Document comment reply creation returned no result');
-        } catch (error) {
-          await Promise.all([
-            mutateReplies((pages) => removeOptimisticReply(pages, clientId), {
-              revalidate: false,
-            }),
-            onReplyCountChange(root.id, -1),
-            onSummaryChange(-1),
-          ]);
-          throw error;
-        }
-
-        try {
-          await mutateReplies((pages) => replaceOptimisticReply(pages, created.comment), {
-            revalidate: false,
-          });
-        } catch (error) {
-          console.error('Failed to reconcile the created document comment reply', error);
-          void reloadReplies();
-        }
-        if (created.isDuplicate) void refreshThread();
+          },
+          optimisticComment,
+          rootCommentId: root.id,
+        });
       },
-      [
-        createOptimistic,
-        mutateReplies,
-        onReplyCountChange,
-        onSummaryChange,
-        refreshThread,
-        reloadReplies,
-        replyTargetId,
-        root,
-        visibleReplies,
-      ],
-    );
-    const handleReplyUpdate: DocumentCommentUpdateHandler = useCallback(
-      async (comment, value) => {
-        const optimisticComment = { ...comment, ...value, updatedAt: new Date() };
-        await Promise.all([
-          mutateReplies((pages) => replaceReplyComment(pages, optimisticComment), {
-            revalidate: false,
-          }),
-          patchFocusedReply(optimisticComment),
-        ]);
-
-        let updated: Awaited<ReturnType<typeof documentCommentService.update>>;
-        try {
-          updated = await documentCommentService.update({ ...value, id: comment.id });
-          if (!updated) throw new Error('Document comment reply update returned no result');
-        } catch (error) {
-          await Promise.all([
-            mutateReplies((pages) => replaceReplyComment(pages, comment), {
-              revalidate: false,
-            }),
-            patchFocusedReply(comment),
-          ]);
-          throw error;
-        }
-
-        try {
-          await Promise.all([
-            mutateReplies((pages) => replaceReplyComment(pages, updated), {
-              revalidate: false,
-            }),
-            patchFocusedReply(updated),
-          ]);
-        } catch (error) {
-          console.error('Failed to reconcile the updated document comment reply', error);
-          void reloadReplies();
-        }
-      },
-      [mutateReplies, patchFocusedReply, reloadReplies],
+      [createOptimistic, replyTargetId, root, visibleReplies],
     );
 
     // NOT_FOUND, or a reply from another thread, means the linked reply is gone; any other
@@ -232,18 +161,23 @@ const Thread = memo<ThreadProps>(
       <Fragment key={reply.id}>
         <CommentCard
           comment={reply}
+          compact={compact}
+          focusScroll={focus?.scroll}
           focusToken={focusedReplyId === reply.id ? focus?.token : undefined}
           replying={replyTargetId === reply.id}
+          threadAuthor={root.author}
           variant={'reply'}
           onMutated={refreshThread}
           onReply={() => toggleReplyTarget(reply.id)}
-          onUpdate={handleReplyUpdate}
+          onUpdate={handleDocumentCommentUpdate}
         />
         {replyTargetId === reply.id && (
           <Composer
             documentId={documentId}
             key={`reply:${reply.id}`}
             parentCommentId={reply.id}
+            plain={compact}
+            onCancel={() => setReplyTargetId(null)}
             onSubmit={handleReplySubmit}
             onSuccess={() => setReplyTargetId(null)}
           />
@@ -252,30 +186,34 @@ const Thread = memo<ThreadProps>(
     );
 
     return (
-      <Flexbox className={styles.thread} ref={containerRef}>
+      <Flexbox className={cx(styles.thread, compact && styles.threadCompact)} ref={containerRef}>
         <CommentCard
           comment={root}
+          compact={compact}
+          focusScroll={focus?.scroll}
           focusToken={focus && focus.commentId === root.id ? focus.token : undefined}
           replying={replyTargetId === root.id}
           onMutated={onMutated}
           onReply={() => toggleReplyTarget(root.id)}
-          onUpdate={onRootUpdate}
+          onUpdate={handleDocumentCommentUpdate}
         />
 
         {(replyCount > 0 || replyTargetId || focusedReplyId) && (
-          <Flexbox className={styles.replyList}>
+          <Flexbox className={cx(styles.replyList, compact && styles.replyListCompact)}>
             {replyTargetId === root.id && (
               <Composer
                 documentId={documentId}
                 key={`reply:${root.id}`}
                 parentCommentId={root.id}
+                plain={compact}
+                onCancel={() => setReplyTargetId(null)}
                 onSubmit={handleReplySubmit}
                 onSuccess={() => setReplyTargetId(null)}
               />
             )}
             {pinnedReply && renderReply(pinnedReply)}
             {replies.isLoadingInitial && replyCount > 0 ? (
-              <SurfaceSkeleton header={false} variant={'list'} />
+              <ReplySkeleton compact={compact} count={replyCount} />
             ) : replies.isInitialError ? (
               <AsyncError
                 error={replies.error}

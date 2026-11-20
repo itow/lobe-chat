@@ -1,3 +1,5 @@
+import type { LocalFilePreviewFailure } from './localFilePreviewFailure';
+
 // Define types for local file operations
 export interface LocalFileItem {
   contentType?: string;
@@ -88,8 +90,63 @@ export interface RenameLocalFileResult {
   success: boolean;
 }
 
+export interface CreateLocalFileParams {
+  /** Initial content. Defaults to an empty file. */
+  content?: string;
+  /** Working directory a relative `path` resolves against. See {@link ListLocalFileParams.cwd}. */
+  cwd?: string;
+  path: string;
+}
+
+export interface CreateLocalDirectoryParams {
+  /** Working directory a relative `path` resolves against. See {@link ListLocalFileParams.cwd}. */
+  cwd?: string;
+  path: string;
+}
+
+/** Result of creating a file or folder. Never overwrites: an existing entry fails. */
+export interface CreateLocalEntryResult {
+  error?: string;
+  path: string;
+  success: boolean;
+}
+
+export interface CopyLocalFileItem {
+  sourcePath: string;
+  /** Omit to duplicate next to the source as `name copy.ext` / `name copy 2.ext`. */
+  targetPath?: string;
+}
+
+export interface CopyLocalFilesParams {
+  /** Working directory each item's relative paths resolve against. See {@link ListLocalFileParams.cwd}. */
+  cwd?: string;
+  items: CopyLocalFileItem[];
+}
+
+export interface LocalCopyFilesResultItem {
+  error?: string;
+  sourcePath: string;
+  success: boolean;
+  /** The path the copy was written to, when it succeeded. */
+  targetPath?: string;
+}
+
 export interface HashLocalFileParams {
   path: string;
+}
+
+export interface LocalFileStatsParams {
+  path: string;
+}
+
+/** Basic facts about a local file, so a model can plan how to read it before opening it. */
+export interface LocalFileStats {
+  /** Number of lines; omitted for binary files and files too large to scan. */
+  lineCount?: number;
+  /** Detected MIME type, when it can be determined. */
+  mimeType?: string;
+  /** Size in bytes. */
+  size: number;
 }
 
 export interface LocalReadFileParams {
@@ -149,8 +206,7 @@ export interface LocalFilePreviewUrlParams {
   workingDirectory: string;
 }
 
-export interface LocalFilePreviewUrlResult {
-  error?: string;
+export interface LocalFilePreviewUrlResult extends LocalFilePreviewFailure {
   success: boolean;
   url?: string;
 }
@@ -189,8 +245,7 @@ export type LocalFilePreview =
   | LocalFilePreviewText
   | LocalFilePreviewUnsupported;
 
-export interface LocalFilePreviewResult {
-  error?: string;
+export interface LocalFilePreviewResult extends LocalFilePreviewFailure {
   preview?: LocalFilePreview;
   success: boolean;
 }
@@ -240,6 +295,11 @@ export interface LocalReadFileResult {
    * Total line count of the entire file.
    */
   totalLineCount: number;
+  /**
+   * True when the content was cut at the output character cap before the
+   * requested `loc` window ended.
+   */
+  truncated?: boolean;
 }
 
 export interface LocalSearchFilesParams {
@@ -274,6 +334,13 @@ export interface LocalSearchFilesParams {
 }
 
 export interface ProjectFileIndexEntry {
+  /**
+   * Directory whose children were deliberately left out of the index because
+   * Git collapsed it (`git ls-files --directory` reports a fully ignored
+   * directory as a single entry). The row is expandable, but its children must
+   * be fetched on demand via `listProjectDirectory`.
+   */
+  collapsed?: boolean;
   /** Whether Git ignore rules match this file or directory. */
   gitIgnored?: boolean;
   isDirectory: boolean;
@@ -291,7 +358,51 @@ export interface ProjectFileIndexResult {
   entries: ProjectFileIndexEntry[];
   indexedAt: string;
   root: string;
-  source: 'git' | 'glob';
+  source: 'git' | 'glob' | 'sandbox';
+  /**
+   * The host stopped short of the whole tree. Set only by hosts that cap a
+   * listing; a tree that is missing entries and does not say so is worse than
+   * one that refuses, because it reads as complete.
+   */
+  truncated?: boolean;
+}
+
+export interface ProjectDirectoryListParams {
+  /** Cap on returned children; the caller is told when more exist. */
+  limit?: number;
+  /** Directory to list, relative to `root`. A trailing slash is tolerated. */
+  relativePath: string;
+  /** Project root the returned `relativePath`s are resolved against. */
+  root: string;
+}
+
+export interface ProjectDirectoryListResult {
+  entries: ProjectFileIndexEntry[];
+  /** True when the directory holds more children than `limit` returned. */
+  truncated: boolean;
+}
+
+export interface TrashLocalFilesParams {
+  paths: string[];
+}
+
+export interface TrashLocalFilesResultItem {
+  /** Error message if this specific path failed. */
+  error?: string;
+  /** The path as it was requested, so the caller can reconcile its own rows. */
+  path: string;
+  success: boolean;
+}
+
+export interface TrashLocalFilesResult {
+  /**
+   * Per-path outcome, in request order. A batch is not atomic: an earlier path
+   * can already be in the trash when a later one fails, so the caller needs
+   * this to reconcile its tree and to retry only what is left.
+   */
+  items: TrashLocalFilesResultItem[];
+  /** True only when every path was trashed. */
+  success: boolean;
 }
 
 export interface ProjectFileSearchParams extends ProjectFileIndexParams {
@@ -319,6 +430,7 @@ export interface OpenLocalFolderParams {
 
 // Shell command types
 export interface RunCommandParams {
+  agentId?: string;
   command: string;
   cwd?: string;
   description?: string;
@@ -345,7 +457,18 @@ export interface RunCommandParams {
    * registries and forges and nothing else.
    */
   sandboxNetwork?: boolean;
+  /**
+   * The directory a sandboxed command may write to, when it differs from
+   * `cwd`. Ignored unless `sandbox` is true; absent means the fence is `cwd`.
+   * Skill scripts set it: they run from the device's shared skill cache, which
+   * must stay out of the fence (a fenced run could otherwise plant code that a
+   * later unfenced run executes), so the fence is the run's working directory
+   * instead. Host-owned like `sandbox` — both injection sites strip a
+   * model-supplied value.
+   */
+  sandboxRoot?: string;
   timeout?: number;
+  topicId?: string;
 }
 
 /**
@@ -644,10 +767,12 @@ export interface ResolveSkillResourcePathResult {
 }
 
 export type ProjectSkillScope = 'device' | 'project';
-export type ProjectSkillSource = '.agents/skills' | '.claude/skills';
+export type ProjectSkillSource = '.agents/skills' | '.claude/skills' | '.codex/skills';
 
 export interface ProjectSkillItem {
   description?: string;
+  /** SKILL.md declares that the model must not invoke this skill automatically. */
+  disableModelInvocation?: boolean;
   /** Total number of regular files under `skillDir` (recursive, including `SKILL.md`). */
   fileCount: number;
   /**
@@ -681,8 +806,8 @@ export interface ListProjectSkillsResult {
 }
 
 export interface InitWorkspaceParams {
-  /** Working directory used to resolve the project root. */
-  scope: string;
+  /** Working directory; omitted to discover only device-level skills. */
+  scope?: string;
 }
 
 /**
@@ -705,6 +830,7 @@ export interface WorkspaceInstructionsItem {
  */
 export interface InitWorkspaceResult {
   instructions: WorkspaceInstructionsItem[];
-  root: string;
+  /** Absent for a device-only scan; no working directory is selected implicitly. */
+  root?: string;
   skills: ProjectSkillItem[];
 }

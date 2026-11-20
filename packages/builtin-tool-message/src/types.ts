@@ -5,6 +5,7 @@ export const MessageToolIdentifier = 'lobe-message';
 // ==================== Supported Platforms ====================
 
 export const MessagePlatform = {
+  dingtalk: 'dingtalk',
   discord: 'discord',
   feishu: 'feishu',
   imessage: 'imessage',
@@ -143,7 +144,20 @@ export interface SendMessageEmbed {
 
 // --- Direct Messaging ---
 
-export interface SendDirectMessageParams {
+/**
+ * Which connection a send goes out through. Both are optional: when neither is
+ * set and the call targets the IM conversation this run is replying in, the
+ * server runtime sends through the same connection the conversation arrived
+ * on (per-agent bot or System Bot messenger). Never set both.
+ */
+export interface MessageSendRoute {
+  /** Per-agent bot id from `listBots`. */
+  botId?: string;
+  /** System Bot connection id from `listMessengers`. */
+  messengerInstallationId?: string;
+}
+
+export interface SendDirectMessageParams extends MessageSendRoute {
   /**
    * Optional: outbound media attachments (images / files / video / audio).
    * Same shape as `SendMessageParams.attachments` — see `SendMessageAttachment`.
@@ -162,7 +176,30 @@ export interface SendDirectMessageParams {
   userId: string;
 }
 
-export interface SendDirectMessageState {
+/**
+ * One outbound attachment that did NOT reach the user, and why. Mirrors the
+ * server's `AttachmentFailure` so the tool result can name the file and the
+ * cause instead of the model assuming every attachment landed.
+ */
+export interface SendAttachmentFailure {
+  /** Loader error or platform error text, when there is one. */
+  detail?: string;
+  name?: string;
+  reason: 'over-budget-no-link' | 'source-unavailable' | 'upload-failed';
+  type: SendMessageAttachment['type'];
+}
+
+/**
+ * Attachment outcome shared by every send state. Both fields are absent when
+ * the send carried no attachments; `attachmentFailures` is absent when every
+ * attachment landed.
+ */
+export interface SendAttachmentsOutcome {
+  attachmentFailures?: SendAttachmentFailure[];
+  attachmentsDelivered?: number;
+}
+
+export interface SendDirectMessageState extends SendAttachmentsOutcome {
   channelId?: string;
   messageId?: string;
   platform?: string;
@@ -188,7 +225,7 @@ export interface SendMessageAttachment {
   type: 'image' | 'file' | 'video' | 'audio';
 }
 
-export interface SendMessageParams {
+export interface SendMessageParams extends MessageSendRoute {
   /**
    * Optional: outbound media attachments (images / files / video / audio).
    * Platforms that don't support outbound media silently drop these so the
@@ -211,7 +248,7 @@ export interface SendMessageParams {
   replyTo?: string;
 }
 
-export interface SendMessageState {
+export interface SendMessageState extends SendAttachmentsOutcome {
   channelId?: string;
   messageId?: string;
   platform?: string;
@@ -247,8 +284,17 @@ export interface ReadMessagesState {
   totalFetched?: number;
 }
 
+export interface MessageItemAttachment {
+  /** MIME type when the platform reports it (Discord `content_type`). */
+  contentType?: string;
+  name: string;
+  /** Bytes, when the platform reports it. */
+  size?: number;
+  url: string;
+}
+
 export interface MessageItem {
-  attachments?: { name: string; url: string }[];
+  attachments?: MessageItemAttachment[];
   author: { id: string; name: string };
   content: string;
   id: string;
@@ -483,7 +529,7 @@ export interface ListThreadsState {
   threads?: { id: string; messageCount?: number; name: string }[];
 }
 
-export interface ReplyToThreadParams {
+export interface ReplyToThreadParams extends MessageSendRoute {
   /**
    * Optional: outbound media attachments (images / files / video / audio).
    * Same shape as `SendMessageParams.attachments` — see `SendMessageAttachment`.
@@ -502,7 +548,7 @@ export interface ReplyToThreadParams {
   threadId: string;
 }
 
-export interface ReplyToThreadState {
+export interface ReplyToThreadState extends SendAttachmentsOutcome {
   messageId?: string;
   threadId?: string;
 }
@@ -779,6 +825,7 @@ export const MESSENGER_PUSH_CONTENT_MAX_LENGTH = 2000;
 
 export const MessengerPushPlatform = {
   discord: 'discord',
+  linq: 'linq',
   slack: 'slack',
   telegram: 'telegram',
   wechat: 'wechat',

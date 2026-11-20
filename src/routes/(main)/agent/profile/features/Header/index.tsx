@@ -1,8 +1,15 @@
 import { isDesktop } from '@lobechat/const';
 import { getActivePluginIds, type LobeAgentConfig } from '@lobechat/types';
-import { DropdownMenu, Flexbox, Icon } from '@lobehub/ui';
-import { ActionIcon, confirmModal, type ModalInstance, toast } from '@lobehub/ui/base-ui';
-import { cssVar } from 'antd-style';
+import {
+  ActionIcon,
+  confirmModal,
+  cssVar,
+  DropdownMenu,
+  Flexbox,
+  Icon,
+  type ModalInstance,
+  toast,
+} from '@lobehub/ui';
 import isEqual from 'fast-deep-equal';
 import type { TFunction } from 'i18next';
 import {
@@ -24,17 +31,19 @@ import { useAgentTransferToMemberMenuItem } from '@/business/client/hooks/useAge
 import { useAuthorInfo } from '@/business/client/hooks/useAuthorInfo';
 import { useBusinessAgentImportMenuItem } from '@/business/client/hooks/useBusinessAgentImportMenuItem';
 import { useHasActiveWorkspace } from '@/business/client/hooks/useHasActiveWorkspace';
+import { useAgentShareSupported } from '@/business/client/useAgentShareSupported';
 import { DESKTOP_HEADER_ICON_SMALL_SIZE } from '@/const/layoutTokens';
 import AgentBreadcrumb from '@/features/AgentBreadcrumb';
 import { useAgentMarketSubmission } from '@/features/AgentMarketSubmission/useAgentMarketSubmission';
 import AgentProfileTabs, { AGENT_PROFILE_TABS_CENTER_STYLE } from '@/features/AgentProfileTabs';
-import { useAgentShareSupported } from '@/features/AgentShareSettings/useAgentShareSupported';
+import { type AgentProfileTab } from '@/features/AgentProfileTabs/tabOptions';
 import NavHeader from '@/features/NavHeader';
 import { formatPageEditorInfoTime } from '@/features/PageEditor/formatPageEditorInfoTime';
 import AccessLevelTag from '@/features/ResourcePermission/AccessLevelTag';
 import { useResourceAccess } from '@/features/ResourcePermission/useResourceAccess';
 import ToggleRightPanelButton from '@/features/RightPanel/ToggleRightPanelButton';
 import { useWorkspaceAwareNavigate } from '@/features/Workspace/useWorkspaceAwareNavigate';
+import { useCopyAgentIdMenuItem } from '@/hooks/useCopyAgentIdMenuItem';
 import { usePermission } from '@/hooks/usePermission';
 import { useAgentStore } from '@/store/agent';
 import { agentSelectors, builtinAgentSelectors } from '@/store/agent/selectors';
@@ -103,7 +112,12 @@ const buildAgentProfileMarkdown = (params: {
   return `${sections.join('\n\n')}\n`;
 };
 
-const Header = memo(() => {
+interface HeaderProps {
+  /** The profile page being shown, so the page switcher highlights it. */
+  active?: AgentProfileTab;
+}
+
+const Header = memo<HeaderProps>(({ active = 'profile' }) => {
   const { i18n, t } = useTranslation(['setting', 'chat', 'file', 'common', 'agent']);
   const dateLocale = i18n?.resolvedLanguage || i18n?.language;
   const navigate = useWorkspaceAwareNavigate();
@@ -175,7 +189,9 @@ const Header = memo(() => {
         toast.success(t('confirmRemoveSessionSuccess', { ns: 'chat' }));
         navigate('/');
       },
-      title: t('confirmRemoveSessionItemAlert', { ns: 'chat' }),
+      content: t('confirmRemoveSessionItemAlert', { ns: 'chat' }),
+      okText: t('delete', { ns: 'common' }),
+      title: t('delete', { ns: 'common' }),
     });
   }, [activeAgentId, canManage, navigate, removeAgent, t]);
 
@@ -237,6 +253,7 @@ const Header = memo(() => {
     t,
   ]);
 
+  const copyAgentIdItem = useCopyAgentIdMenuItem(activeAgentId);
   const importMenuItem = useBusinessAgentImportMenuItem(activeAgentId ?? undefined);
   const transferMenuItems = useAgentTransferMenuItem(activeAgentId ?? undefined, meta);
   // Ownership handover to a workspace member — separate from the scope moves.
@@ -252,7 +269,9 @@ const Header = memo(() => {
   );
 
   const { visible: shareVisible } = useAgentShareSupported(activeAgentId);
-  const canShareAgent = shareVisible === true && canConfigure;
+  // External sharing is stronger than General Access `edit`: only the Agent
+  // creator or a Workspace admin (`canManageResource`) may manage the link.
+  const canShareAgent = shareVisible === true && canManage;
 
   const showMarketSubmission = !!config && !isBuiltinAgent && !isHeterogeneous;
   const canSubmitToMarket = showMarketSubmission && canManage && !lockedByOther && !lockPending;
@@ -329,6 +348,7 @@ const Header = memo(() => {
         key: 'export',
         label: t('pageEditor.menu.export', { ns: 'file' }),
       },
+      copyAgentIdItem,
       importMenuItem ? { type: 'divider' as const } : null,
       importMenuItem,
       businessTransferMenuItems.length > 0 || transferToMemberItem
@@ -379,6 +399,7 @@ const Header = memo(() => {
     canConfigure,
     canManage,
     canSubmitToMarket,
+    copyAgentIdItem,
     createdAt,
     dateLocale,
     handleExportMarkdown,
@@ -449,7 +470,7 @@ const Header = memo(() => {
         },
       }}
     >
-      {activeAgentId && <AgentProfileTabs active={'profile'} agentId={activeAgentId} />}
+      {activeAgentId && <AgentProfileTabs active={active} agentId={activeAgentId} />}
     </NavHeader>
   );
 });

@@ -159,15 +159,8 @@ describe('AgentRuntimeService.executeSync', () => {
       const state = await stateManager.loadAgentState(operationId);
       expect(state).not.toBeNull();
       expect(state?.messages).toHaveLength(2);
-      expect(state?.metadata?.agentId).toBe('test-agent');
-      expect(state?.metadata?.topicId).toBe('topic-1');
-    });
-  });
-
-  describe('getCoordinator', () => {
-    it('should return the coordinator instance', () => {
-      const coordinator = service.getCoordinator();
-      expect(coordinator).toBeDefined();
+      expect(state?.origin?.agentId).toBe('test-agent');
+      expect(state?.origin?.topicId).toBe('topic-1');
     });
   });
 

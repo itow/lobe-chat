@@ -1,4 +1,4 @@
-import { readFile, realpath, stat } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
@@ -6,9 +6,12 @@ import { WORKSPACE_HTML_ARTIFACT_MAX_FILE_BYTES } from '@lobechat/html-artifact/
 import { getMimeType, resolveMimeType } from '@lobechat/utils/mimeType';
 
 import type {
+  CopyAssetForPublishParams,
+  CopyAssetForPublishResult,
   ExternalAssetForPublishParams,
   ExternalAssetForPublishResult,
   LocalFilePreview,
+  LocalFilePreviewFailureCode,
   LocalFilePreviewResult,
   LocalFilePreviewUrlParams,
 } from './types';
@@ -90,6 +93,33 @@ const expandHomePath = (target: string): string => {
   return target;
 };
 
+/**
+ * Terminal reason of a filesystem failure while previewing a file, or
+ * `undefined` for one worth retrying (I/O error, busy, …). Shared with the
+ * desktop preview protocol so both transports classify the same way.
+ */
+export const localFilePreviewFailureCode = (
+  error: unknown,
+): LocalFilePreviewFailureCode | undefined => {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  if (code === 'ENOENT' || code === 'ENOTDIR') return 'not_found';
+  if (code === 'EACCES' || code === 'EPERM') return 'forbidden';
+  return undefined;
+};
+
+/** A preview read refused because the file resolves outside the approved roots. */
+export const outsideWorkspacePreviewFailure = (): LocalFilePreviewResult => ({
+  code: 'forbidden',
+  error: 'File is outside the approved workspace',
+  success: false,
+});
+
+/** The failed result for a thrown preview error, with its terminal code if any. */
+export const toLocalFilePreviewFailure = (error: unknown): LocalFilePreviewResult => {
+  const code = localFilePreviewFailureCode(error);
+  return { ...(code && { code }), error: (error as Error).message, success: false };
+};
+
 /** Resolve the real path, tolerating non-existent targets. */
 const safeRealpath = async (target: string): Promise<string> => {
   try {
@@ -117,16 +147,30 @@ export const defaultGetLocalFilePreview = async (
       return { error: 'Missing working directory', success: false };
     }
 
-    const realRoot = await safeRealpath(expandHomePath(workingDirectory));
-    const realFile = await safeRealpath(expandHomePath(filePath));
-    const withinRoot = realFile === realRoot || realFile.startsWith(`${realRoot}${path.sep}`);
-    if (!withinRoot) {
-      return { error: 'File is outside the approved workspace', success: false };
+    const isWithin = (target: string, base: string) =>
+      target === base || target.startsWith(`${base}${path.sep}`);
+    const lexicalRoot = path.resolve(expandHomePath(workingDirectory));
+    const realRoot = await safeRealpath(lexicalRoot);
+    const lexicalFile = path.resolve(expandHomePath(filePath));
+    let realFile: string;
+    try {
+      realFile = await realpath(lexicalFile);
+    } catch (error) {
+      const failure = localFilePreviewFailureCode(error);
+      // A deleted file has no real path to contain; judge it by where it was.
+      if (
+        failure === 'not_found' &&
+        (isWithin(lexicalFile, lexicalRoot) || isWithin(lexicalFile, realRoot))
+      )
+        return { code: 'not_found', error: (error as Error).message, success: false };
+      realFile = lexicalFile;
     }
+    const withinRoot = isWithin(realFile, realRoot);
+    if (!withinRoot) return outsideWorkspacePreviewFailure();
 
     const stats = await stat(realFile);
     if (!stats.isFile()) {
-      return { error: 'Path is not a file', success: false };
+      return { code: 'not_found', error: 'Path is not a file', success: false };
     }
 
     // Oversized documents can only ever produce the content-less fallback —
@@ -156,7 +200,7 @@ export const defaultGetLocalFilePreview = async (
 
     return { preview: serializePreviewFile(buffer, contentType), success: true };
   } catch (error) {
-    return { error: (error as Error).message, success: false };
+    return toLocalFilePreviewFailure(error);
   }
 };
 
@@ -185,6 +229,59 @@ export const defaultReadExternalAssetForPublish = async ({
       contentType: await resolveMimeType(realFile, buffer),
       success: true,
     };
+  } catch (error) {
+    return { error: (error as Error).message, success: false };
+  }
+};
+
+const resolvePublishPath = (target: string, workingDirectory: string): string => {
+  const expanded = expandHomePath(target);
+  return path.isAbsolute(expanded)
+    ? expanded
+    : path.resolve(expandHomePath(workingDirectory), expanded);
+};
+
+// The destination usually does not exist yet, so realpath the nearest existing
+// ancestor and re-append the missing tail; otherwise a symlinked tmp root
+// (`/var` → `/private/var`) never matches the realpath'd workspace root.
+const realpathForCreate = async (target: string): Promise<string> => {
+  const missing: string[] = [];
+  let current = path.resolve(target);
+  for (;;) {
+    try {
+      return path.join(await realpath(current), ...missing);
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return path.join(current, ...missing);
+      missing.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+};
+
+export const defaultCopyAssetForPublish = async ({
+  from,
+  to,
+  workingDirectory,
+}: CopyAssetForPublishParams): Promise<CopyAssetForPublishResult> => {
+  try {
+    if (!workingDirectory) return { error: 'Missing working directory', success: false };
+    const realRoot = await safeRealpath(expandHomePath(workingDirectory));
+    const target = await realpathForCreate(resolvePublishPath(to, workingDirectory));
+    if (!target.startsWith(`${realRoot}${path.sep}`)) {
+      return { error: 'Destination is outside the approved workspace', success: false };
+    }
+
+    const realSource = await realpath(resolvePublishPath(from, workingDirectory));
+    const stats = await stat(realSource);
+    if (!stats.isFile()) return { error: 'Path is not a file', success: false };
+    if (stats.size > EXTERNAL_PUBLISH_ASSET_MAX_BYTES) {
+      return { error: 'File is too large to publish', success: false };
+    }
+
+    await mkdir(path.dirname(target), { recursive: true });
+    await copyFile(realSource, target);
+    return { success: true };
   } catch (error) {
     return { error: (error as Error).message, success: false };
   }

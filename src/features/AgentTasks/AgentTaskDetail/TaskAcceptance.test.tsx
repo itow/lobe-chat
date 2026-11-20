@@ -17,7 +17,7 @@ const mocks = vi.hoisted(() => ({
   bundle: undefined as
     | undefined
     | {
-        acceptance: { id: string; requirement: string };
+        acceptance: { completedAt?: string; id: string; requirement: string; status?: string };
         checks: Array<{
           category: string;
           id: string;
@@ -27,7 +27,7 @@ const mocks = vi.hoisted(() => ({
         isOwner: boolean;
       },
   currentPortalView: null as null | string,
-  confirmModal: vi.fn(),
+  openDeleteConfirm: vi.fn(),
   deleteAcceptance: vi.fn(),
   mutateBundle: vi.fn(),
   mutateSubject: vi.fn(),
@@ -42,14 +42,17 @@ const mocks = vi.hoisted(() => ({
 
 // Real base-ui ActionIcon only surfaces its title via a hover Tooltip; the
 // assertions click the title text directly.
-vi.mock('@lobehub/ui/base-ui', async (importOriginal) => ({
+vi.mock('@lobehub/ui', async (importOriginal) => ({
   ...(await importOriginal<object>()),
   ActionIcon: ({ onClick, title }: { onClick?: () => void; title?: string }) => (
     <button type="button" onClick={onClick}>
       {title}
     </button>
   ),
-  confirmModal: (opts: unknown) => mocks.confirmModal(opts),
+}));
+
+vi.mock('@/features/Acceptance/Workspace/AcceptanceDeleteConfirm', () => ({
+  openAcceptanceDeleteConfirm: (opts: unknown) => mocks.openDeleteConfirm(opts),
 }));
 
 vi.mock('@/features/Workspace/useWorkspaceAwareNavigate', () => ({
@@ -60,8 +63,6 @@ vi.mock('antd', async (importOriginal) => ({
   ...(await importOriginal<object>()),
   App: { useApp: () => ({ message: { error: vi.fn() } }) },
 }));
-
-vi.mock('@/components/NeuralNetworkLoading', () => ({ default: () => <div>loading</div> }));
 
 vi.mock('@/features/Acceptance', async () => ({
   // The real row/list primitives: the assertions cover the shared grammar.
@@ -119,8 +120,11 @@ vi.mock('@/features/Acceptance/Viewer/AcceptanceScope', () => ({
 }));
 
 vi.mock('@/features/Acceptance/Viewer/Checks/AcceptanceCheckInventory', () => ({
-  default: ({ toolbar }: { toolbar?: ReactNode }) => (
-    <div data-testid="acceptance-check-inventory">{toolbar}</div>
+  default: ({ titleExtra, toolbar }: { titleExtra?: ReactNode; toolbar?: ReactNode }) => (
+    <div data-testid="acceptance-check-inventory">
+      {titleExtra}
+      {toolbar}
+    </div>
   ),
 }));
 
@@ -130,7 +134,7 @@ vi.mock('@/features/Acceptance/Viewer/Review/AcceptanceDecision', () => ({
 
 vi.mock('@/services/verify', () => ({
   verifyService: {
-    deleteAcceptance: (id: string) => mocks.deleteAcceptance(id),
+    deleteAcceptance: (id: string, purge?: boolean) => mocks.deleteAcceptance(id, purge),
     reviewChecks: vi.fn(),
   },
 }));
@@ -301,6 +305,25 @@ describe('TaskAcceptance', () => {
     expect(screen.queryByText('taskDetail.acceptance.title')).not.toBeInTheDocument();
   });
 
+  it('moves a signed-off verdict into the checklist title and drops the decision bar', () => {
+    mocks.acceptanceSubject = { id: 'acceptance-1' };
+    mocks.bundle = {
+      acceptance: {
+        completedAt: '2026-11-10T10:50:00.000Z',
+        id: 'acceptance-1',
+        requirement: 'Everything is verifiable.',
+        status: 'accepted',
+      },
+      checks: [{ category: 'Setup', id: 'c1', seq: 1, title: 'Create task' }],
+      isOwner: true,
+    };
+
+    render(<TaskAcceptance variant={'result'} />);
+
+    expect(screen.getByText('taskDetail.acceptanceState.accepted')).toBeInTheDocument();
+    expect(screen.queryByTestId('acceptance-decision')).not.toBeInTheDocument();
+  });
+
   it('keeps the report link reachable from the inventory toolbar in the result panel', () => {
     mocks.acceptanceSubject = { id: 'acceptance-1' };
     mocks.bundle = {
@@ -355,13 +378,21 @@ describe('TaskAcceptance', () => {
     render(<TaskAcceptance />);
 
     fireEvent.click(screen.getByText('taskDetail.acceptance.remove'));
-    expect(mocks.confirmModal).toHaveBeenCalledTimes(1);
+    expect(mocks.openDeleteConfirm).toHaveBeenCalledTimes(1);
+    expect(mocks.openDeleteConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({
+        description: 'taskDetail.acceptance.removeConfirm.content',
+        ids: ['acceptance-1'],
+      }),
+    );
     expect(mocks.deleteAcceptance).not.toHaveBeenCalled();
 
-    const opts = mocks.confirmModal.mock.calls[0][0] as { onOk: () => Promise<void> };
-    await opts.onOk();
+    const opts = mocks.openDeleteConfirm.mock.calls[0][0] as {
+      onDelete: (purge: boolean) => Promise<void>;
+    };
+    await opts.onDelete(true);
 
-    expect(mocks.deleteAcceptance).toHaveBeenCalledWith('acceptance-1');
+    expect(mocks.deleteAcceptance).toHaveBeenCalledWith('acceptance-1', true);
     expect(mocks.updateVerifyConfig).toHaveBeenCalledWith('T-231', {
       enabled: false,
       requirement: null,
@@ -387,8 +418,10 @@ describe('TaskAcceptance', () => {
     render(<TaskAcceptance />);
 
     fireEvent.click(screen.getByText('taskDetail.acceptance.remove'));
-    const opts = mocks.confirmModal.mock.calls[0][0] as { onOk: () => Promise<void> };
-    await expect(opts.onOk()).rejects.toThrow('config write failed');
+    const opts = mocks.openDeleteConfirm.mock.calls[0][0] as {
+      onDelete: (purge: boolean) => Promise<void>;
+    };
+    await expect(opts.onDelete(false)).rejects.toThrow('config write failed');
 
     expect(mocks.deleteAcceptance).not.toHaveBeenCalled();
     expect(mocks.mutateSubject).not.toHaveBeenCalled();
@@ -423,26 +456,5 @@ describe('TaskAcceptance', () => {
 
     expect(screen.getByText('Current check')).toBeInTheDocument();
     expect(screen.getByText('Removed check')).toBeInTheDocument();
-  });
-
-  it('groups a checklist only after it exceeds ten checks', () => {
-    mocks.acceptanceSubject = { id: 'acceptance-1' };
-    mocks.bundle = {
-      acceptance: { id: 'acceptance-1', requirement: 'Everything is verifiable.' },
-      checks: Array.from({ length: 11 }, (_, index) => ({
-        category: index < 6 ? 'Setup' : 'Result',
-        id: `c${index + 1}`,
-        seq: index + 1,
-        title: `Check ${index + 1}`,
-      })),
-      isOwner: true,
-    };
-
-    render(<TaskAcceptance />);
-
-    expect(screen.getByText('Setup')).toBeInTheDocument();
-    expect(screen.getByText('Result')).toBeInTheDocument();
-    expect(screen.getByText('taskDetail.acceptance.collapseAll')).toBeInTheDocument();
-    expect(screen.getByText('Check 11')).toBeInTheDocument();
   });
 });

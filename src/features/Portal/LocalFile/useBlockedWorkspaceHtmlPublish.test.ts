@@ -17,7 +17,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('debug', () => ({ default: () => mocks.debugLog }));
 
-vi.mock('@lobehub/ui/base-ui', async (importOriginal) => ({
+vi.mock('@lobehub/ui', async (importOriginal) => ({
   ...(await importOriginal<object>()),
   confirmModal: (...args: unknown[]) => mocks.confirmModal(...args),
   toast: { error: (...args: unknown[]) => mocks.toastError(...args) },
@@ -132,6 +132,22 @@ describe('useBlockedWorkspaceHtmlPublish', () => {
       workingDirectory: '/project',
     });
     expect(mocks.openConfirm).toHaveBeenCalledOnce();
+  });
+
+  it('hands the confirmed plan to runPublish instead of publishing inline', async () => {
+    mocks.prepare.mockResolvedValueOnce(ready).mockResolvedValueOnce(ready);
+    mocks.copy.mockResolvedValue(copied);
+    const runPublish = vi.fn();
+    const { result } = renderHook(() => useBlockedWorkspaceHtmlPublish({ ...input, runPublish }));
+
+    await act(() => result.current.handleContinue());
+    mocks.openConfirm.mock.calls[0][0].onOk();
+
+    expect(runPublish).toHaveBeenCalledWith({
+      plan: ready,
+      successMessage: 'workingPanel.localFile.publish.outsideWorkspace.copiedToast',
+    });
+    expect(mocks.publishPrepared).not.toHaveBeenCalled();
   });
 
   it('shows newly discovered closure files and requires a second click before copying', async () => {

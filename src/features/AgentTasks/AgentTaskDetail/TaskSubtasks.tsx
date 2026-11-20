@@ -1,11 +1,19 @@
 import type { TaskDetailSubtask } from '@lobechat/types';
-import { Block, Flexbox, Icon } from '@lobehub/ui';
-import { ActionIcon, confirmModal, Text, toast } from '@lobehub/ui/base-ui';
-import { ConfigProvider, Tree } from 'antd';
-import type { DataNode } from 'antd/es/tree';
-import { cssVar } from 'antd-style';
-import { ChevronDown, ListTodoIcon, PlayCircle, Plus } from 'lucide-react';
-import type { Key, MouseEvent } from 'react';
+import type { TreeDataNode } from '@lobehub/ui';
+import {
+  ActionIcon,
+  Block,
+  Collapsible,
+  confirmModal,
+  cssVar,
+  Flexbox,
+  Icon,
+  Text,
+  toast,
+  Tree,
+} from '@lobehub/ui';
+import { ArchiveIcon, ListTodoIcon, PlayCircle, Plus } from 'lucide-react';
+import type { MouseEvent } from 'react';
 import { memo, useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -32,6 +40,7 @@ import AccordionArrowIcon from '../shared/AccordionArrowIcon';
 import { shouldShowMemberAssignee } from '../shared/memberAssigneeMode';
 import { styles } from '../shared/style';
 import { taskDetailPath } from '../shared/taskDetailPath';
+import { useTaskListOriginState } from '../shared/taskListOrigin';
 import RunSubtasksPreview from './RunSubtasksPreview';
 import TopicStatusIcon from './TopicStatusIcon';
 
@@ -79,13 +88,13 @@ const SubtaskTitle = memo<{ task: TaskDetailSubtask }>(({ task }) => {
         style={{ alignItems: 'center', display: 'inline-flex', flex: 'none' }}
         onClick={(e) => e.stopPropagation()}
       >
-        <TaskPriorityTag priority={task.priority} size={14} taskIdentifier={task.identifier} />
+        <TaskPriorityTag priority={task.priority} size={14} taskIdentifier={task.id} />
       </span>
       <span
         style={{ alignItems: 'center', display: 'inline-flex', flex: 'none' }}
         onClick={(e) => e.stopPropagation()}
       >
-        <TaskStatusTag size={14} status={status} taskIdentifier={task.identifier}>
+        <TaskStatusTag size={14} status={status} taskIdentifier={task.id}>
           {hasRunningTopic ? <TopicStatusIcon size={14} status="running" /> : undefined}
         </TaskStatusTag>
       </span>
@@ -94,6 +103,7 @@ const SubtaskTitle = memo<{ task: TaskDetailSubtask }>(({ task }) => {
           {task.identifier}
         </Text>
       )}
+      {task.archivedAt && <Icon color={cssVar.colorTextDescription} icon={ArchiveIcon} size={14} />}
       <Text ellipsis fontSize={13} style={{ flex: 1, minWidth: 0 }}>
         {task.name || task.identifier}
       </Text>
@@ -114,15 +124,14 @@ const SubtaskTitle = memo<{ task: TaskDetailSubtask }>(({ task }) => {
         {shouldShowMemberAssignee(activeWorkspaceId, task.assigneeUserId) && (
           <AssigneeMemberSelector
             currentUserId={task.assigneeUserId ?? null}
-            disabled={isRunning}
             taskCreatorId={task.createdByUserId}
-            taskIdentifier={task.identifier}
+            taskIdentifier={task.id}
             taskVisibility={task.visibility}
           >
             <span
               style={{
                 alignItems: 'center',
-                cursor: isRunning ? 'not-allowed' : 'pointer',
+                cursor: 'pointer',
                 display: 'inline-flex',
                 flex: 'none',
               }}
@@ -138,7 +147,8 @@ const SubtaskTitle = memo<{ task: TaskDetailSubtask }>(({ task }) => {
         <AssigneeAgentSelector
           currentAgentId={task.assignee?.id ?? null}
           disabled={isRunning}
-          taskIdentifier={task.identifier}
+          taskCreatorId={task.createdByUserId}
+          taskIdentifier={task.id}
           taskVisibility={task.visibility}
         >
           <span
@@ -157,10 +167,10 @@ const SubtaskTitle = memo<{ task: TaskDetailSubtask }>(({ task }) => {
   );
 });
 
-const toTreeData = (tree: TaskTreeNode[]): DataNode[] => {
+const toTreeData = (tree: TaskTreeNode[]): TreeDataNode[] => {
   return tree.map((node) => ({
     children: toTreeData(node.children),
-    key: node.task.identifier,
+    key: node.task.id!,
     title: <SubtaskTitle task={node.task} />,
   }));
 };
@@ -169,6 +179,7 @@ const TaskSubtasks = memo(() => {
   const { t } = useTranslation('chat');
 
   const navigate = useWorkspaceAwareNavigate();
+  const taskListOriginState = useTaskListOriginState();
   const { allowed: canEditTask, reason } = usePermission('create_content');
   const agentId = useTaskStore(taskDetailSelectors.activeTaskAgentId);
   // Subtask composers inherit the parent's visibility as their default — a
@@ -189,7 +200,7 @@ const TaskSubtasks = memo(() => {
     const map = new Map<string, TaskDetailSubtask>();
     const walk = (items: TaskDetailSubtask[]) => {
       for (const item of items) {
-        map.set(item.identifier, item);
+        if (item.id) map.set(item.id, item);
         if (item.children?.length) walk(item.children);
       }
     };
@@ -198,11 +209,15 @@ const TaskSubtasks = memo(() => {
   }, [subtasks]);
 
   const handleNavigate = useCallback(
-    (identifier: string) => {
-      const subtask = subtaskMap.get(identifier);
-      navigate(taskDetailPath(identifier, subtask?.assignee?.id ?? undefined));
+    (id: string) => {
+      const subtask = subtaskMap.get(id);
+      if (!subtask?.id) return;
+      navigate(
+        taskDetailPath(subtask.identifier, subtask?.assignee?.id ?? undefined, subtask?.name),
+        { state: taskListOriginState },
+      );
     },
-    [navigate, subtaskMap],
+    [navigate, subtaskMap, taskListOriginState],
   );
 
   const treeData = useMemo(() => {
@@ -211,25 +226,35 @@ const TaskSubtasks = memo(() => {
   }, [subtasks]);
 
   const handleRightClick = useCallback(
-    ({ event, node }: { event: MouseEvent; node: { key: Key } }) => {
+    ({ event, node }: { event: MouseEvent; node: TreeDataNode }) => {
       if (!canEditTask) return;
-      const subtask = subtaskMap.get(String(node.key));
+      const subtask = subtaskMap.get(node.key);
       if (!subtask) return;
       event.preventDefault();
       showContextMenu(
         buildItems({
+          id: subtask.id!,
+          archivedAt: subtask.archivedAt ?? null,
           assigneeAgentId: subtask.assignee?.id,
           assigneeUserId: subtask.assigneeUserId,
+          automationMode: subtask.automationMode,
+          heartbeatInterval: subtask.heartbeat?.interval,
           identifier: subtask.identifier,
           priority: subtask.priority,
+          schedulePattern: subtask.schedule?.pattern,
           status: subtask.status,
         }),
       );
       installKeyboardHandlers({
+        id: subtask.id!,
+        archivedAt: subtask.archivedAt ?? null,
         assigneeAgentId: subtask.assignee?.id,
         assigneeUserId: subtask.assigneeUserId,
+        automationMode: subtask.automationMode,
+        heartbeatInterval: subtask.heartbeat?.interval,
         identifier: subtask.identifier,
         priority: subtask.priority,
+        schedulePattern: subtask.schedule?.pattern,
         status: subtask.status,
       });
     },
@@ -311,7 +336,7 @@ const TaskSubtasks = memo(() => {
                 gap={8}
                 paddingBlock={4}
                 paddingInline={8}
-                style={{ cursor: 'pointer', width: 'fit-content' }}
+                style={{ cursor: 'pointer', marginInlineStart: -8, width: 'fit-content' }}
                 variant="borderless"
                 onClick={() => setIsExpanded((prev) => !prev)}
               >
@@ -348,8 +373,8 @@ const TaskSubtasks = memo(() => {
               />
             </Flexbox>
           </Flexbox>
-          {isExpanded && (
-            <>
+          <Collapsible open={isExpanded}>
+            <Flexbox gap={8}>
               {isCreating && (
                 <CreateTaskInlineEntry
                   autoFocus
@@ -361,24 +386,20 @@ const TaskSubtasks = memo(() => {
                   onCreated={() => setIsCreating(false)}
                 />
               )}
-              <ConfigProvider theme={{ components: { Tree: { titleHeight: 36 } } }}>
-                <Tree
-                  blockNode
-                  defaultExpandAll
-                  showLine
-                  className={styles.subtaskTree}
-                  switcherIcon={<Icon icon={ChevronDown} size={14} />}
-                  treeData={treeData}
-                  onRightClick={handleRightClick}
-                  onSelect={(keys) => {
-                    const key = keys[0];
-                    if (!key) return;
-                    handleNavigate(String(key));
-                  }}
-                />
-              </ConfigProvider>
-            </>
-          )}
+              <Tree
+                blockNode
+                defaultExpandAll
+                showLine
+                classNames={{ title: styles.subtaskTreeTitle }}
+                styles={{ node: { height: 36 } }}
+                treeData={treeData}
+                onRightClick={handleRightClick}
+                onSelect={(keys) => {
+                  if (keys[0]) handleNavigate(keys[0]);
+                }}
+              />
+            </Flexbox>
+          </Collapsible>
         </>
       ) : (
         <>
@@ -389,7 +410,7 @@ const TaskSubtasks = memo(() => {
             gap={8}
             paddingBlock={4}
             paddingInline={8}
-            style={{ width: 'fit-content' }}
+            style={{ marginInlineStart: -8, width: 'fit-content' }}
             title={canEditTask ? undefined : reason}
             variant="borderless"
             onClick={toggleCreating}

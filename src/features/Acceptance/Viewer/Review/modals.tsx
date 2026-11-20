@@ -1,14 +1,16 @@
 'use client';
 
-import { Flexbox, TextArea } from '@lobehub/ui';
 import {
   Button,
   createModal,
+  Flexbox,
   type ModalInstance,
   Text,
+  TextArea,
   useModalContext,
-} from '@lobehub/ui/base-ui';
-import { createStaticStyles, cssVar } from 'antd-style';
+} from '@lobehub/ui';
+import { cssVar } from '@lobehub/ui/stylex/cssVar.stylex';
+import * as stylex from '@stylexjs/stylex';
 import { t } from 'i18next';
 import { memo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -18,15 +20,17 @@ import {
   AttachmentUploadButton,
   useFeedbackAttachments,
 } from '../Evidence/attachments';
+import RejectFeedbackPreview from './RejectFeedbackPreview';
 
-const styles = createStaticStyles(({ css }) => ({
-  warning: css`
-    padding-block: 10px;
-    padding-inline: 14px;
-    border-radius: ${cssVar.borderRadiusLG};
-    background: ${cssVar.colorWarningBg};
-  `,
-}));
+const styles = stylex.create({
+  warning: {
+    paddingBlock: '12px',
+    paddingInline: '16px',
+    borderRadius: cssVar.borderRadiusLG,
+    backgroundColor: cssVar.colorWarningBg,
+    backgroundImage: 'none',
+  },
+});
 
 /**
  * A frosted scrim for the acceptance decision dialogs — the page behind reads
@@ -63,8 +67,8 @@ const AcceptContent = memo<AcceptContentProps>(({ exceptions, onConfirm, subject
     <Flexbox gap={16}>
       <Text>{translate('acceptance.accept.summary', { title: subjectTitle })}</Text>
       {exceptions.length > 0 && (
-        <Flexbox className={styles.warning} gap={4}>
-          <Text strong fontSize={13}>
+        <Flexbox className={stylex.props(styles.warning).className} gap={4}>
+          <Text strong>
             {translate('acceptance.accept.exceptionsTitle', { count: exceptions.length })}
           </Text>
           {exceptions.map((title) => (
@@ -103,11 +107,17 @@ export const openAcceptModal = (options: AcceptContentProps): ModalInstance =>
   });
 
 interface RejectContentProps {
-  /** Perform the reject with the reason; resolve true to close. */
+  /** Previews the open feedback the repair agent reads alongside the reason, so
+      the reviewer knows whose comments and screenshots ride along. */
+  acceptanceId: string;
+  /** The rounds name an authoring agent — the server sends the reject back to
+      it. Without one the dialog promises no next round: it copies the prompt. */
+  dispatchAvailable: boolean;
+  /** Perform the reject with an optional reason; resolve true to close. */
   onConfirm: (comment: string) => Promise<boolean>;
 }
 
-const RejectContent = memo<RejectContentProps>(({ onConfirm }) => {
+const RejectContent = memo<RejectContentProps>(({ acceptanceId, dispatchAvailable, onConfirm }) => {
   const { t: translate } = useTranslation('verify');
   const { close } = useModalContext();
   const [comment, setComment] = useState('');
@@ -115,7 +125,6 @@ const RejectContent = memo<RejectContentProps>(({ onConfirm }) => {
 
   const handleConfirm = async () => {
     const trimmed = comment.trim();
-    if (!trimmed) return;
     setLoading(true);
     try {
       if (await onConfirm(trimmed)) close();
@@ -126,8 +135,13 @@ const RejectContent = memo<RejectContentProps>(({ onConfirm }) => {
 
   return (
     <Flexbox gap={16}>
-      <Text fontSize={13} type={'secondary'}>
-        {translate('acceptance.reject.description')}
+      {/* What the repair prompt carries besides the reason leads the dialog —
+            otherwise nobody can tell whether teammates' notes go along. */}
+      <RejectFeedbackPreview acceptanceId={acceptanceId} />
+      <Text type={'secondary'}>
+        {translate(
+          dispatchAvailable ? 'acceptance.reject.description' : 'acceptance.reject.descriptionCopy',
+        )}
       </Text>
       <TextArea
         autoSize={{ maxRows: 6, minRows: 3 }}
@@ -139,13 +153,12 @@ const RejectContent = memo<RejectContentProps>(({ onConfirm }) => {
         <Button disabled={loading} onClick={close}>
           {translate('acceptance.actions.cancel')}
         </Button>
-        <Button
-          disabled={!comment.trim()}
-          loading={loading}
-          type={'primary'}
-          onClick={handleConfirm}
-        >
-          {translate('acceptance.actions.confirmReject')}
+        <Button loading={loading} type={'primary'} onClick={handleConfirm}>
+          {translate(
+            dispatchAvailable
+              ? 'acceptance.actions.confirmReject'
+              : 'acceptance.actions.confirmRejectCopy',
+          )}
         </Button>
       </Flexbox>
     </Flexbox>
@@ -154,7 +167,7 @@ const RejectContent = memo<RejectContentProps>(({ onConfirm }) => {
 
 RejectContent.displayName = 'AcceptanceRejectContent';
 
-/** Reject dialog — the reason is required: it is the next round's input, not a note. */
+/** Reject dialog — an optional reason adds context for the next repair round. */
 export const openRejectModal = (options: RejectContentProps): ModalInstance =>
   createModal({
     content: <RejectContent {...options} />,
@@ -162,7 +175,7 @@ export const openRejectModal = (options: RejectContentProps): ModalInstance =>
     maskClosable: true,
     styles: frostedModalStyles,
     title: t('acceptance.actions.reject', { ns: 'verify' }),
-    width: 'min(90vw, 480px)',
+    width: 'min(90vw, 520px)',
   });
 
 interface GroupFeedbackContentProps {
@@ -195,7 +208,7 @@ const GroupFeedbackContent = memo<GroupFeedbackContentProps>(
 
     return (
       <Flexbox gap={16}>
-        <Text fontSize={13} type={'secondary'}>
+        <Text type={'secondary'}>
           {description ?? translate('acceptance.group.feedbackDescription', { label: groupLabel })}
         </Text>
         <Flexbox gap={8}>

@@ -1,4 +1,5 @@
 import { type LobeChatDatabase } from '@lobechat/database';
+import { agentShareFileAccessScope } from '@lobechat/types';
 import { TRPCError } from '@trpc/server';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -12,6 +13,7 @@ import { FileService } from '../../file';
 import { publishResourceEvent } from '../../resourceEvents';
 import { DocumentHistoryService } from '../history';
 import { DocumentService } from '../index';
+import { PARSED_FILE_CONTENT_MAX_CHARS } from '../parsedFileCap';
 
 vi.mock('@/server/modules/AgentRuntime/redis', () => ({ getAgentRuntimeRedisClient: () => null }));
 vi.mock('@/database/models/document');
@@ -25,6 +27,8 @@ vi.mock('../../resourceEvents', () => ({ publishResourceEvent: vi.fn() }));
 
 const publishResourceEventMock = vi.mocked(publishResourceEvent);
 vi.mock('@lobechat/file-loaders', () => ({
+  isFileParseBudgetError: (error: unknown) =>
+    error instanceof Error && error.name === 'FileParseBudgetError',
   loadFile: vi.fn(),
   UnsupportedFileTypeError: class UnsupportedFileTypeError extends Error {
     fileType: string;
@@ -36,6 +40,18 @@ vi.mock('@lobechat/file-loaders', () => ({
     }
   },
 }));
+// The worker-thread boundary. Real threads are covered by `fileParse/*.test.ts`; here the same
+// pure steps run in-process so these cases keep asserting how the service uses the result.
+vi.mock('../../fileParse', async () => {
+  const { loadFile } = await import('@lobechat/file-loaders');
+  const { capParsedFileDocument, stripPageWrappers } = await import('../parsedFileCap');
+  return {
+    parseFileInWorker: vi.fn(async (filePath: string, { mode }: { mode: 'document' | 'file' }) => {
+      const loaded = await loadFile(filePath);
+      return capParsedFileDocument(mode === 'document' ? stripPageWrappers(loaded) : loaded);
+    }),
+  };
+});
 vi.mock('debug', () => ({
   default: () => vi.fn(),
 }));
@@ -259,6 +275,29 @@ describe('DocumentService', () => {
       expect(result).toEqual(mockDoc);
     });
 
+    it('should strip caller-provided agent-share provenance from document metadata', async () => {
+      mockFileModel.create.mockResolvedValue({ id: 'file-1' });
+      mockDocumentModel.create.mockResolvedValue({ id: 'doc-1' });
+
+      await service.createDocument({
+        title: 'Test',
+        editorData: {},
+        knowledgeBaseId: 'kb-1',
+        metadata: {
+          agentShare: { shareId: 'forged-share', visitorUserId: 'forged-visitor' },
+          existingKey: 'value',
+        },
+      });
+
+      expect(mockFileModel.create).toHaveBeenCalledWith(
+        expect.objectContaining({ metadata: { existingKey: 'value' } }),
+        false,
+      );
+      expect(mockDocumentModel.create).toHaveBeenCalledWith(
+        expect.objectContaining({ metadata: { existingKey: 'value' } }),
+      );
+    });
+
     it('should NOT create a file record when fileType is custom/folder', async () => {
       const mockDoc = { id: 'doc-1', title: 'My Folder' };
       mockDocumentModel.create.mockResolvedValue(mockDoc);
@@ -453,6 +492,52 @@ describe('DocumentService', () => {
         expect(mockFileModel.create).not.toHaveBeenCalled();
         expect(mockDocumentModel.create).not.toHaveBeenCalled();
       });
+    });
+
+    it('treats blank parentId and knowledgeBaseId from tool calls as unset', async () => {
+      mockFileModel.create.mockResolvedValue({ id: 'file-1' });
+      mockDocumentModel.create.mockResolvedValue({ id: 'doc-1' });
+
+      await service.createDocument({
+        title: 'Root Doc',
+        editorData: {},
+        knowledgeBaseId: 'kb-1',
+        parentId: '',
+      });
+      await service.createDocument({
+        title: 'Loose Doc',
+        editorData: {},
+        knowledgeBaseId: ' ',
+        parentId: ' ',
+      });
+
+      expect(mockFileModel.create).toHaveBeenCalledTimes(1);
+      expect(mockFileModel.create.mock.calls[0]?.[0]).toMatchObject({ parentId: undefined });
+      for (const [input] of mockDocumentModel.create.mock.calls) {
+        expect(input.parentId).toBeUndefined();
+      }
+      expect(mockDocumentModel.create.mock.calls[1]?.[0]).toMatchObject({
+        fileId: null,
+        knowledgeBaseId: undefined,
+      });
+    });
+
+    it('rejects an unknown knowledge base in personal mode before writing any row', async () => {
+      mockKnowledgeBaseModel.findById.mockResolvedValue(undefined);
+
+      await expect(
+        service.createDocument({
+          title: 'Doc',
+          editorData: {},
+          knowledgeBaseId: 'default',
+        }),
+      ).rejects.toMatchObject({
+        code: 'NOT_FOUND',
+        message: 'Knowledge base not found: default',
+      });
+
+      expect(mockFileModel.create).not.toHaveBeenCalled();
+      expect(mockDocumentModel.create).not.toHaveBeenCalled();
     });
 
     it('omits visibility on the KB mirror file in personal mode', async () => {
@@ -760,7 +845,7 @@ describe('DocumentService', () => {
 
     it('should update content and recalculate char/line counts', async () => {
       const newContent = 'Updated\nContent';
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(createCurrentDocument());
 
       const result = await service.updateDocument('doc-1', { content: newContent });
@@ -774,12 +859,17 @@ describe('DocumentService', () => {
         }),
       );
       expect(mockDocumentHistoryService.createHistory).not.toHaveBeenCalled();
-      expect(result).toEqual({ historyAppended: false, id: 'doc-1' });
+      expect(result).toEqual({
+        historyAppended: false,
+        id: 'doc-1',
+        savedAt: undefined,
+        updatedAt: expect.any(Date),
+      });
     });
 
     it('should append history when editorData changes', async () => {
       const editorData = { blocks: [{ type: 'paragraph', text: 'Hello' }] };
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(createCurrentDocument());
 
       const result = await service.updateDocument('doc-1', { editorData, saveSource: 'manual' });
@@ -798,6 +888,24 @@ describe('DocumentService', () => {
       expect(result.historyAppended).toBe(true);
       expect(result.id).toBe('doc-1');
       expect(result.savedAt).toBeInstanceOf(Date);
+    });
+
+    it('should return the updatedAt written to the row, matching the history savedAt', async () => {
+      const editorData = { blocks: [{ type: 'paragraph', text: 'Hello' }] };
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
+      mockDocumentModel.findById.mockResolvedValue(createCurrentDocument());
+
+      const result = await service.updateDocument('doc-1', { editorData, saveSource: 'manual' });
+
+      expect(mockDocumentModel.update).toHaveBeenCalledWith(
+        'doc-1',
+        expect.not.objectContaining({ updatedAt: expect.anything() }),
+      );
+      expect(mockDocumentHistoryService.createHistory).toHaveBeenCalledWith(
+        expect.objectContaining({ savedAt: result.updatedAt }),
+      );
+      expect(result.updatedAt).toEqual(new Date('2026-04-12T00:00:00.000Z'));
+      expect(result.savedAt).toEqual(result.updatedAt);
     });
 
     it('should persist raw editorData with diff nodes and normalize only the history snapshot', async () => {
@@ -820,7 +928,7 @@ describe('DocumentService', () => {
           ],
         },
       };
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(
         createCurrentDocument({ editorData: createEditorDataWithDiffNode() }),
       );
@@ -864,7 +972,7 @@ describe('DocumentService', () => {
 
     it('accepts the save when expectedUpdatedAt matches the stored row', async () => {
       const storedUpdatedAt = new Date('2026-04-11T00:00:00.000Z');
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(createCurrentDocument());
       (mockDb as any).select = vi.fn(() => ({
         from: () => ({
@@ -881,12 +989,17 @@ describe('DocumentService', () => {
         'doc-1',
         expect.objectContaining({ content: 'retry payload' }),
       );
-      expect(result).toEqual({ historyAppended: false, id: 'doc-1' });
+      expect(result).toEqual({
+        historyAppended: false,
+        id: 'doc-1',
+        savedAt: undefined,
+        updatedAt: expect.any(Date),
+      });
     });
 
     it('should skip history when editorData is unchanged', async () => {
       const editorData = { blocks: [] };
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(createCurrentDocument());
 
       const result = await service.updateDocument('doc-1', { editorData });
@@ -896,7 +1009,27 @@ describe('DocumentService', () => {
         expect.objectContaining({ editorData }),
       );
       expect(mockDocumentHistoryService.createHistory).not.toHaveBeenCalled();
-      expect(result).toEqual({ historyAppended: false, id: 'doc-1' });
+      expect(result).toEqual({
+        historyAppended: false,
+        id: 'doc-1',
+        savedAt: undefined,
+        updatedAt: expect.any(Date),
+      });
+    });
+
+    it('should return the pre-existing updatedAt unchanged when nothing is written', async () => {
+      const currentDocument = createCurrentDocument();
+      mockDocumentModel.findById.mockResolvedValue(currentDocument);
+
+      const result = await service.updateDocument('doc-1', { saveSource: 'manual' });
+
+      expect(mockDocumentModel.update).not.toHaveBeenCalled();
+      expect(result).toEqual({
+        historyAppended: false,
+        id: 'doc-1',
+        savedAt: undefined,
+        updatedAt: currentDocument.updatedAt,
+      });
     });
 
     it('should report members newly mentioned by this save on the accepted view', async () => {
@@ -919,7 +1052,7 @@ describe('DocumentService', () => {
           type: 'root',
         },
       };
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(
         createCurrentDocument({ editorData: currentEditorData }),
       );
@@ -941,7 +1074,7 @@ describe('DocumentService', () => {
           type: 'root',
         },
       };
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(
         createCurrentDocument({ editorData: currentEditorData }),
       );
@@ -953,7 +1086,7 @@ describe('DocumentService', () => {
     });
 
     it('should update title and filename together', async () => {
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(createCurrentDocument());
 
       await service.updateDocument('doc-1', { title: 'New Title' });
@@ -968,7 +1101,7 @@ describe('DocumentService', () => {
     });
 
     it('should sync title update to associated file', async () => {
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(createCurrentDocument({ fileId: 'file-1' }));
       mockFileModel.update.mockResolvedValue(undefined);
 
@@ -978,7 +1111,7 @@ describe('DocumentService', () => {
     });
 
     it('should sync parentId update to associated file', async () => {
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(createCurrentDocument({ fileId: 'file-1' }));
       mockFileModel.update.mockResolvedValue(undefined);
 
@@ -988,7 +1121,7 @@ describe('DocumentService', () => {
     });
 
     it('should sync both title and parentId to file when both are updated', async () => {
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(createCurrentDocument({ fileId: 'file-1' }));
       mockFileModel.update.mockResolvedValue(undefined);
 
@@ -1001,7 +1134,7 @@ describe('DocumentService', () => {
     });
 
     it('should NOT update file when document has no associated file', async () => {
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(createCurrentDocument());
 
       await service.updateDocument('doc-1', { title: 'New Title' });
@@ -1011,7 +1144,7 @@ describe('DocumentService', () => {
 
     it('should update metadata', async () => {
       const metadata = { key: 'value' };
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(createCurrentDocument());
 
       await service.updateDocument('doc-1', { metadata });
@@ -1023,7 +1156,7 @@ describe('DocumentService', () => {
     });
 
     it('should update fileType', async () => {
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(createCurrentDocument());
 
       await service.updateDocument('doc-1', { fileType: 'text/markdown' });
@@ -1035,7 +1168,7 @@ describe('DocumentService', () => {
     });
 
     it('should handle parentId null (moving to root)', async () => {
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(createCurrentDocument({ fileId: 'file-1' }));
       mockFileModel.update.mockResolvedValue(undefined);
 
@@ -1067,7 +1200,7 @@ describe('DocumentService', () => {
       // Private rows are creator-only; a leftover lease from a publish →
       // unpublish flip must not turn every autosave into a CONFLICT loop.
       const wsService = new DocumentService(mockDb, userId, 'ws-1');
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(
         createCurrentDocument({ visibility: 'private', workspaceId: 'ws-1' }),
       );
@@ -1081,7 +1214,7 @@ describe('DocumentService', () => {
 
     it('should allow a workspace save when no other member holds the lock', async () => {
       const wsService = new DocumentService(mockDb, userId, 'ws-1');
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(createCurrentDocument({ workspaceId: 'ws-1' }));
       vi.spyOn(EditLockService.prototype, 'canWrite').mockResolvedValue(true);
 
@@ -1092,7 +1225,7 @@ describe('DocumentService', () => {
 
     it('checks workspace body saves against the provided lock owner id', async () => {
       const wsService = new DocumentService(mockDb, userId, 'ws-1');
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       mockDocumentModel.findById.mockResolvedValue(createCurrentDocument({ workspaceId: 'ws-1' }));
       const guardSpy = vi.spyOn(EditLockService.prototype, 'canWrite').mockResolvedValue(true);
 
@@ -1104,7 +1237,7 @@ describe('DocumentService', () => {
 
     it('allows a metadata-only save while another member holds the lock (only the body is locked)', async () => {
       const wsService = new DocumentService(mockDb, userId, 'ws-1');
-      mockDocumentModel.update.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModel.update.mockResolvedValue(new Date('2026-04-12T00:00:00.000Z'));
       // Current body matches what the autosave re-sends — only title changes.
       mockDocumentModel.findById.mockResolvedValue(
         createCurrentDocument({ content: 'body', editorData: { blocks: [] }, workspaceId: 'ws-1' }),
@@ -1764,6 +1897,34 @@ describe('DocumentService', () => {
       expect(result).toEqual({ id: 'doc-1', title: 'My Doc' });
     });
 
+    it('strips page tags before capping an oversized PDF', async () => {
+      const page = 'x'.repeat(1000);
+      const pageCount = Math.ceil(PARSED_FILE_CONTENT_MAX_CHARS / page.length) + 2;
+      const content = Array.from(
+        { length: pageCount },
+        (_, index) => `<page number="${index + 1}">${page}</page>`,
+      ).join('');
+      vi.mocked(loadFile).mockResolvedValue({
+        content,
+        fileType: 'pdf',
+        metadata: {},
+        pages: undefined,
+        totalCharCount: content.length,
+        totalLineCount: 1,
+      } as any);
+      mockDocumentModel.create.mockResolvedValue({ id: 'doc-1' });
+
+      await service.parseDocument('file-1');
+
+      const created = mockDocumentModel.create.mock.calls[0][0];
+      expect(created.content).toHaveLength(PARSED_FILE_CONTENT_MAX_CHARS);
+      expect(created.content).not.toContain('<page');
+      expect(created.metadata).toMatchObject({
+        originalCharCount: page.length * pageCount,
+        truncated: true,
+      });
+    });
+
     it('should use filename as title when metadata has no title', async () => {
       vi.mocked(loadFile).mockResolvedValue({
         content: 'Content',
@@ -1832,6 +1993,29 @@ describe('DocumentService', () => {
       });
     });
 
+    it('should cap oversized parsed text before storing it', async () => {
+      vi.mocked(loadFile).mockResolvedValue({
+        content: 'a'.repeat(PARSED_FILE_CONTENT_MAX_CHARS + 10),
+        fileType: 'txt',
+        metadata: {},
+        pages: [{ content: 'a'.repeat(PARSED_FILE_CONTENT_MAX_CHARS + 10) }],
+        totalCharCount: PARSED_FILE_CONTENT_MAX_CHARS + 10,
+        totalLineCount: 1,
+      } as any);
+      mockDocumentModel.create.mockResolvedValue({ id: 'doc-1' });
+
+      await service.parseFile('file-1');
+
+      const created = mockDocumentModel.create.mock.calls.at(-1)![0];
+      expect(created.content).toHaveLength(PARSED_FILE_CONTENT_MAX_CHARS);
+      expect(created.totalCharCount).toBe(PARSED_FILE_CONTENT_MAX_CHARS);
+      expect(created.pages).toBeUndefined();
+      expect(created.metadata).toMatchObject({
+        originalCharCount: PARSED_FILE_CONTENT_MAX_CHARS + 10,
+        truncated: true,
+      });
+    });
+
     it('should parse a file and create document record with pages', async () => {
       vi.mocked(loadFile).mockResolvedValue({
         content: 'Full file content',
@@ -1862,6 +2046,32 @@ describe('DocumentService', () => {
       );
       expect(mockCleanup).toHaveBeenCalled();
       expect(result).toEqual({ id: 'doc-1', title: 'Readme' });
+    });
+
+    it('should preserve agent-share provenance when downloading a visitor file', async () => {
+      const accessScope = agentShareFileAccessScope({
+        shareId: 'share-1',
+        visitorUserId: 'visitor-1',
+      });
+      vi.mocked(loadFile).mockResolvedValue({
+        content: 'Visitor content',
+        fileType: 'markdown',
+        metadata: {},
+        totalCharCount: 15,
+        totalLineCount: 1,
+      } as any);
+      mockDocumentModel.create.mockResolvedValue({ id: 'doc-visitor' });
+
+      await service.parseFile('file-visitor', accessScope);
+
+      expect(mockDocumentModel.findByFileId).toHaveBeenCalledWith('file-visitor', accessScope);
+      expect(mockFileService.downloadFileToLocal).toHaveBeenCalledWith(
+        'file-visitor',
+        accessScope,
+        {
+          maxBytes: 64 * 1024 * 1024,
+        },
+      );
     });
 
     it('should use file name as title (stripping extension) when metadata has no title', async () => {
@@ -1965,8 +2175,11 @@ describe('DocumentService', () => {
         userId,
         'workspace-1',
         'public',
+        { type: 'ordinary' },
       );
-      expect(transactionModel.findByFileId).toHaveBeenCalledWith('file-1');
+      expect(transactionModel.findByFileId).toHaveBeenCalledWith('file-1', {
+        type: 'ordinary',
+      });
       expect(transactionModel.create).toHaveBeenCalledTimes(1);
       expect(mockDocumentModel.create).not.toHaveBeenCalled();
       // Both have to happen after the lock is held — re-checking before it would

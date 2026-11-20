@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { GeneralChatAgent, GraphAgent } from '@lobechat/agent-runtime';
 import type { AgentGraph } from '@lobechat/types';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   type AgentInterventionContinuationProvenance,
@@ -10,39 +10,41 @@ import {
 import { createRuntimeExecutors } from '@/server/modules/AgentRuntime/RuntimeExecutors';
 
 import { AgentRuntimeService } from '../AgentRuntimeService';
+import { stubRunningDurableOperation } from '../AgentRuntimeService/__tests__/testUtils';
 import { CriticalAgentInterventionPersistenceError } from '../CompletionLifecycle';
 import { hookDispatcher } from '../hooks';
+
+const runningOperationState = (lastModified: string) => ({
+  status: 'running',
+  stepCount: 5,
+  lastModified,
+  metadata: {},
+});
+
+const testRuntimeState = () => ({
+  metadata: {
+    agentConfig: {},
+  },
+  modelRuntimeConfig: { model: 'gpt-test', provider: 'lobehub' },
+  origin: {
+    userId: 'user-1',
+  },
+});
+
+const queueOptions = (scheduleMessage: ReturnType<typeof vi.fn>) => ({
+  queueService: { getImpl: () => ({}), scheduleMessage } as any,
+});
 
 // Mock all heavy dependencies to isolate executeStep logic
 vi.mock('@/envs/app', () => ({ appEnv: { APP_URL: 'http://localhost:3010' } }));
 vi.mock('@/database/models/message', () => ({
   MessageModel: vi.fn().mockImplementation(function () {
-    return {};
+    return { query: vi.fn().mockResolvedValue([]) };
   }),
 }));
-vi.mock('@/server/modules/AgentRuntime', () => ({
-  AgentRuntimeCoordinator: vi.fn().mockImplementation(function () {
-    return {
-      loadAgentState: vi.fn(),
-      saveAgentState: vi.fn(),
-      saveStepResult: vi.fn(),
-      createAgentOperation: vi.fn(),
-      getOperationMetadata: vi.fn(),
-      isInterrupted: vi.fn().mockResolvedValue(false),
-      tryClaimStep: vi.fn().mockResolvedValue(true),
-      releaseStepLock: vi.fn().mockResolvedValue(undefined),
-      refreshStepLock: vi.fn().mockResolvedValue(true),
-    };
-  }),
-  createStreamEventManager: vi.fn(function () {
-    return {
-      publishStreamEvent: vi.fn(),
-      publishAgentRuntimeEnd: vi.fn(),
-      publishAgentRuntimeInit: vi.fn(),
-      cleanupOperation: vi.fn(),
-    };
-  }),
-}));
+vi.mock('@/server/modules/AgentRuntime', () =>
+  import('./testUtils').then((m) => m.executeStepAgentRuntimeModule()),
+);
 vi.mock('@/server/modules/AgentRuntime/RuntimeExecutors', () => ({
   createRuntimeExecutors: vi.fn(function () {
     return {};
@@ -76,6 +78,10 @@ vi.mock('@lobechat/builtin-tools/dynamicInterventionAudits', () => ({
   dynamicInterventionAudits: [],
 }));
 
+beforeEach(() => {
+  stubRunningDurableOperation();
+});
+
 describe('AgentRuntimeService intervention continuation dispatch recovery', () => {
   const operationId = 'op-intervention-recovery';
   const provenance: AgentInterventionContinuationProvenance = {
@@ -93,8 +99,10 @@ describe('AgentRuntimeService intervention continuation dispatch recovery', () =
   const readyState = (status: 'done' | 'idle' | 'running' = 'idle') => ({
     initialContext: { phase: 'user_input' },
     metadata: {
-      agentInterventionContinuation: provenance,
       agentInterventionPreparation: preparation,
+    },
+    origin: {
+      continuation: provenance,
     },
     operationId,
     status,
@@ -104,9 +112,7 @@ describe('AgentRuntimeService intervention continuation dispatch recovery', () =
     'backfills durable preparation and a stable queue ACK from %s state',
     async (status) => {
       const scheduleMessage = vi.fn().mockResolvedValue('queue-message');
-      const service = new AgentRuntimeService({} as any, 'user-1', {
-        queueService: { getImpl: () => ({}), scheduleMessage } as any,
-      });
+      const service = new AgentRuntimeService({} as any, 'user-1', queueOptions(scheduleMessage));
       const coordinator = (service as any).coordinator;
       coordinator.loadAgentState = vi.fn().mockResolvedValue(readyState(status));
       const operationModel = (service as any).agentOperationModel;
@@ -142,21 +148,19 @@ describe('AgentRuntimeService intervention continuation dispatch recovery', () =
 
   it('does not enqueue again when the exact durable queue ACK already exists', async () => {
     const scheduleMessage = vi.fn();
-    const service = new AgentRuntimeService({} as any, 'user-1', {
-      queueService: { getImpl: () => ({}), scheduleMessage } as any,
-    });
+    const service = new AgentRuntimeService({} as any, 'user-1', queueOptions(scheduleMessage));
     const coordinator = (service as any).coordinator;
     coordinator.loadAgentState = vi.fn().mockResolvedValue(readyState('running'));
     const operationModel = (service as any).agentOperationModel;
     operationModel.findById = vi.fn().mockResolvedValue({
       metadata: {
-        agentInterventionContinuation: provenance,
         agentInterventionDispatch: {
           deduplicationId,
           messageId: 'queue-message',
           resolutionRequestId: provenance.resolutionRequestId,
           state: 'scheduled',
         },
+        agentInterventionContinuation: provenance,
         agentInterventionPreparation: preparation,
       },
     });
@@ -172,9 +176,7 @@ describe('AgentRuntimeService intervention continuation dispatch recovery', () =
 
   it('fails closed on a conflicting durable preparation marker', async () => {
     const scheduleMessage = vi.fn();
-    const service = new AgentRuntimeService({} as any, 'user-1', {
-      queueService: { getImpl: () => ({}), scheduleMessage } as any,
-    });
+    const service = new AgentRuntimeService({} as any, 'user-1', queueOptions(scheduleMessage));
     const coordinator = (service as any).coordinator;
     coordinator.loadAgentState = vi.fn().mockResolvedValue(readyState());
     const operationModel = (service as any).agentOperationModel;
@@ -320,11 +322,7 @@ describe('AgentRuntimeService.executeStep - early exit on terminal state', () =>
     });
 
     await (service as any).createAgentRuntime({
-      metadata: {
-        agentConfig: {},
-        modelRuntimeConfig: { model: 'gpt-test', provider: 'lobehub' },
-        userId: 'user-1',
-      },
+      agentState: testRuntimeState(),
       operationId: 'op-workspace',
       stepIndex: 0,
     });
@@ -344,7 +342,11 @@ describe('AgentRuntimeService.executeStep - early exit on terminal state', () =>
     };
 
     await (service as any).createAgentRuntime({
-      metadata: { agentConfig: {}, modelRuntimeConfig, userId: 'user-1' },
+      agentState: {
+        metadata: { agentConfig: {} },
+        modelRuntimeConfig,
+        origin: { userId: 'user-1' },
+      },
       operationId: 'op-model-runtime-snapshot',
       stepIndex: 0,
     });
@@ -362,11 +364,7 @@ describe('AgentRuntimeService.executeStep - early exit on terminal state', () =>
     });
 
     await (service as any).createAgentRuntime({
-      metadata: {
-        agentConfig: {},
-        modelRuntimeConfig: { model: 'gpt-test', provider: 'lobehub' },
-        userId: 'user-1',
-      },
+      agentState: testRuntimeState(),
       operationId: 'op-custom-agent',
       stepIndex: 0,
     });
@@ -391,11 +389,7 @@ describe('AgentRuntimeService.executeStep - early exit on terminal state', () =>
     });
 
     await (service as any).createAgentRuntime({
-      metadata: {
-        agentConfig: {},
-        modelRuntimeConfig: { model: 'gpt-test', provider: 'lobehub' },
-        userId: 'user-1',
-      },
+      agentState: testRuntimeState(),
       operationId: 'op-graph-agent',
       stepIndex: 0,
     });
@@ -413,11 +407,7 @@ describe('AgentRuntimeService.executeStep - early exit on terminal state', () =>
     });
 
     await (service as any).createAgentRuntime({
-      metadata: {
-        agentConfig: {},
-        modelRuntimeConfig: { model: 'gpt-test', provider: 'lobehub' },
-        userId: 'user-1',
-      },
+      agentState: testRuntimeState(),
       operationId: 'op-general-agent',
       stepIndex: 0,
     });
@@ -453,11 +443,15 @@ describe('AgentRuntimeService.executeStep - early exit on terminal state', () =>
     const service = new AgentRuntimeService({} as any, 'user-1', { queueService: null });
 
     await (service as any).createAgentRuntime({
-      agentState: sandboxToolCallState('/work/deck.pptx'),
-      metadata: {
-        agentConfig: {},
+      agentState: {
+        ...sandboxToolCallState('/work/deck.pptx'),
+        metadata: {
+          agentConfig: {},
+        },
         modelRuntimeConfig: { model: 'gpt-test', provider: 'lobehub' },
-        userId: 'user-1',
+        origin: {
+          userId: 'user-1',
+        },
       },
       operationId: 'op-entity-edit',
       stepIndex: 3,
@@ -473,11 +467,15 @@ describe('AgentRuntimeService.executeStep - early exit on terminal state', () =>
     const service = new AgentRuntimeService({} as any, 'user-1', { queueService: null });
 
     await (service as any).createAgentRuntime({
-      agentState: sandboxToolCallState('/work/notes.md'),
-      metadata: {
-        agentConfig: {},
+      agentState: {
+        ...sandboxToolCallState('/work/notes.md'),
+        metadata: {
+          agentConfig: {},
+        },
         modelRuntimeConfig: { model: 'gpt-test', provider: 'lobehub' },
-        userId: 'user-1',
+        origin: {
+          userId: 'user-1',
+        },
       },
       operationId: 'op-plain-edit',
       stepIndex: 3,
@@ -492,12 +490,9 @@ describe('AgentRuntimeService.executeStep - early exit on terminal state', () =>
     const service = createService();
 
     const coordinator = (service as any).coordinator;
-    coordinator.loadAgentState = vi.fn().mockResolvedValue({
-      status: 'running',
-      stepCount: 5,
-      lastModified: new Date().toISOString(),
-      metadata: {},
-    });
+    coordinator.loadAgentState = vi
+      .fn()
+      .mockResolvedValue(runningOperationState(new Date().toISOString()));
 
     // The step will attempt to proceed (and fail due to mocked deps),
     // but the key assertion is that it does NOT take the early-exit path
@@ -524,7 +519,7 @@ describe('AgentRuntimeService.executeStep - durable Review lifecycle retry', () 
       cost: { currency: 'USD', total: 0 },
       lastModified: new Date().toISOString(),
       messages: [],
-      metadata: { _hooks: [] },
+      host: { hooks: [] },
       operationId: 'op-review-retry',
       status: 'running',
       stepCount: 0,
@@ -692,17 +687,47 @@ describe('AgentRuntimeService.executeStep - step idempotency (distributed lock)'
     expect(coordinator.releaseStepLock).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['a stale delivery it acks', 9],
+    ['a live holder it hands back', 5],
+  ])('drops the buffered trace partial on %s', async (_label, stepCount) => {
+    const service = createService();
+    const coordinator = (service as any).coordinator;
+    coordinator.tryClaimStep = vi.fn().mockResolvedValue(false);
+    coordinator.loadAgentState = vi.fn().mockResolvedValue({ status: 'running', stepCount });
+    const discardPartial = vi.spyOn((service as any).traceRecorder, 'discardPartial');
+
+    await service.executeStep({ operationId: 'op-locked', stepIndex: 5 });
+
+    expect(discardPartial).toHaveBeenCalled();
+  });
+
+  it('drops the buffered trace partial when it re-queues itself after losing the lock', async () => {
+    const scheduleMessage = vi.fn().mockResolvedValue('msg-1');
+    const service = new AgentRuntimeService({} as any, 'user-1', queueOptions(scheduleMessage));
+    const coordinator = (service as any).coordinator;
+    coordinator.tryClaimStep = vi.fn().mockResolvedValue(false);
+    coordinator.loadAgentState = vi.fn().mockResolvedValue({ status: 'running', stepCount: 5 });
+    const discardPartial = vi.spyOn((service as any).traceRecorder, 'discardPartial');
+
+    const result = await service.executeStep({ operationId: 'op-requeue', stepIndex: 5 });
+
+    // This path returns before the generic lock-conflict fallback, so it needs
+    // the same hand-over cleanup: the steps this invocation buffered belong to
+    // whoever holds the operation now.
+    expect(result.lockRescheduled).toBe(true);
+    expect(discardPartial).toHaveBeenCalled();
+  });
+
   it('should re-queue the same step on its own backoff for a non-stale lock conflict', async () => {
     const scheduleMessage = vi.fn().mockResolvedValue('msg-1');
-    const service = new AgentRuntimeService({} as any, 'user-1', {
-      queueService: { getImpl: () => ({}), scheduleMessage } as any,
-    });
+    const service = new AgentRuntimeService({} as any, 'user-1', queueOptions(scheduleMessage));
     const coordinator = (service as any).coordinator;
     coordinator.tryClaimStep = vi.fn().mockResolvedValue(false);
     coordinator.loadAgentState = vi.fn().mockResolvedValue({
       status: 'running',
       stepCount: 5,
-      metadata: { queueRetries: 5, queueRetryDelay: '10000' },
+      host: { queue: { retries: 5, retryDelay: '10000' } },
     });
 
     const result = await service.executeStep({ operationId: 'op-requeue', stepIndex: 5 });
@@ -725,9 +750,7 @@ describe('AgentRuntimeService.executeStep - step idempotency (distributed lock)'
 
   it('should carry the delivery resume payload into the re-queued lock-conflict message', async () => {
     const scheduleMessage = vi.fn().mockResolvedValue('msg-1');
-    const service = new AgentRuntimeService({} as any, 'user-1', {
-      queueService: { getImpl: () => ({}), scheduleMessage } as any,
-    });
+    const service = new AgentRuntimeService({} as any, 'user-1', queueOptions(scheduleMessage));
     const coordinator = (service as any).coordinator;
     coordinator.tryClaimStep = vi.fn().mockResolvedValue(false);
     coordinator.loadAgentState = vi.fn().mockResolvedValue({ status: 'running', stepCount: 5 });
@@ -754,9 +777,7 @@ describe('AgentRuntimeService.executeStep - step idempotency (distributed lock)'
 
   it('should carry an async-tool resume flag into the re-queued lock-conflict message', async () => {
     const scheduleMessage = vi.fn().mockResolvedValue('msg-1');
-    const service = new AgentRuntimeService({} as any, 'user-1', {
-      queueService: { getImpl: () => ({}), scheduleMessage } as any,
-    });
+    const service = new AgentRuntimeService({} as any, 'user-1', queueOptions(scheduleMessage));
     const coordinator = (service as any).coordinator;
     coordinator.tryClaimStep = vi.fn().mockResolvedValue(false);
     coordinator.loadAgentState = vi.fn().mockResolvedValue({ status: 'running', stepCount: 5 });
@@ -775,9 +796,7 @@ describe('AgentRuntimeService.executeStep - step idempotency (distributed lock)'
 
   it('should back off exponentially across successive lock-conflict re-deliveries', async () => {
     const scheduleMessage = vi.fn().mockResolvedValue('msg-1');
-    const service = new AgentRuntimeService({} as any, 'user-1', {
-      queueService: { getImpl: () => ({}), scheduleMessage } as any,
-    });
+    const service = new AgentRuntimeService({} as any, 'user-1', queueOptions(scheduleMessage));
     const coordinator = (service as any).coordinator;
     coordinator.tryClaimStep = vi.fn().mockResolvedValue(false);
     coordinator.loadAgentState = vi.fn().mockResolvedValue({ status: 'running', stepCount: 5 });
@@ -797,9 +816,7 @@ describe('AgentRuntimeService.executeStep - step idempotency (distributed lock)'
 
   it('should fall back to a retryable response once the lock-conflict backoff is exhausted', async () => {
     const scheduleMessage = vi.fn().mockResolvedValue('msg-1');
-    const service = new AgentRuntimeService({} as any, 'user-1', {
-      queueService: { getImpl: () => ({}), scheduleMessage } as any,
-    });
+    const service = new AgentRuntimeService({} as any, 'user-1', queueOptions(scheduleMessage));
     const coordinator = (service as any).coordinator;
     coordinator.tryClaimStep = vi.fn().mockResolvedValue(false);
     coordinator.loadAgentState = vi.fn().mockResolvedValue({ status: 'running', stepCount: 5 });
@@ -818,9 +835,7 @@ describe('AgentRuntimeService.executeStep - step idempotency (distributed lock)'
 
   it('should stay retryable when re-queueing after a lock conflict fails', async () => {
     const scheduleMessage = vi.fn().mockRejectedValue(new Error('qstash down'));
-    const service = new AgentRuntimeService({} as any, 'user-1', {
-      queueService: { getImpl: () => ({}), scheduleMessage } as any,
-    });
+    const service = new AgentRuntimeService({} as any, 'user-1', queueOptions(scheduleMessage));
     const coordinator = (service as any).coordinator;
     coordinator.tryClaimStep = vi.fn().mockResolvedValue(false);
     coordinator.loadAgentState = vi.fn().mockResolvedValue({ status: 'running', stepCount: 5 });
@@ -939,12 +954,9 @@ describe('AgentRuntimeService.executeStep - step idempotency (distributed lock)'
     const service = createService();
     const coordinator = (service as any).coordinator;
     coordinator.tryClaimStep = vi.fn().mockResolvedValue(true);
-    coordinator.loadAgentState = vi.fn().mockResolvedValue({
-      status: 'running',
-      stepCount: 5,
-      lastModified: new Date().toISOString(),
-      metadata: {},
-    });
+    coordinator.loadAgentState = vi
+      .fn()
+      .mockResolvedValue(runningOperationState(new Date().toISOString()));
 
     // executeStep will hit an error internally (mocked deps are incomplete)
     // but the catch block handles it and returns error state instead of throwing
@@ -1043,12 +1055,7 @@ describe('AgentRuntimeService.executeStep - Redis failure in error handler', () 
     coordinator.loadAgentState = vi.fn().mockImplementation(function () {
       loadCallCount++;
       if (loadCallCount === 1) {
-        return Promise.resolve({
-          status: 'running',
-          stepCount: 5,
-          lastModified: new Date().toISOString(),
-          metadata: {},
-        });
+        return Promise.resolve(runningOperationState(new Date().toISOString()));
       }
       return Promise.reject(new Error('Reached the max retries per request limit (which is 3)'));
     });
@@ -1101,12 +1108,7 @@ describe('AgentRuntimeService.executeStep - Redis failure in error handler', () 
     coordinator.loadAgentState = vi.fn().mockImplementation(function () {
       loadCallCount++;
       if (loadCallCount === 1) {
-        return Promise.resolve({
-          status: 'running',
-          stepCount: 5,
-          lastModified: new Date().toISOString(),
-          metadata: {},
-        });
+        return Promise.resolve(runningOperationState(new Date().toISOString()));
       }
       return Promise.reject(new Error('Redis ECONNRESET'));
     });
@@ -1157,12 +1159,7 @@ describe('AgentRuntimeService.executeStep - Redis failure in error handler', () 
     coordinator.loadAgentState = vi.fn().mockImplementation(function () {
       loadCallCount++;
       if (loadCallCount === 1) {
-        return Promise.resolve({
-          status: 'running',
-          stepCount: 5,
-          lastModified: new Date().toISOString(),
-          metadata: {},
-        });
+        return Promise.resolve(runningOperationState(new Date().toISOString()));
       }
       return Promise.reject(new Error('Redis ECONNRESET'));
     });
@@ -1204,12 +1201,7 @@ describe('AgentRuntimeService.executeStep - Redis failure in error handler', () 
     coordinator.loadAgentState = vi.fn().mockImplementation(function () {
       loadCallCount++;
       if (loadCallCount === 1) {
-        return Promise.resolve({
-          status: 'running',
-          stepCount: 5,
-          lastModified: new Date().toISOString(),
-          metadata: {},
-        });
+        return Promise.resolve(runningOperationState(new Date().toISOString()));
       }
       return Promise.resolve(null);
     });
@@ -1251,8 +1243,8 @@ describe('AgentRuntimeService.executeStep - Redis failure in error handler', () 
       status: 'running',
       stepCount: 5,
       lastModified: new Date().toISOString(),
-      metadata: {
-        _hooks: [
+      host: {
+        hooks: [
           {
             id: 'test-hook',
             type: 'onComplete',
@@ -1286,7 +1278,7 @@ describe('AgentRuntimeService.executeStep - Redis failure in error handler', () 
       }),
     ).rejects.toThrow();
 
-    // onComplete hooks must be dispatched with the full state including metadata
+    // onComplete hooks must be dispatched with the full state including the host envelope
     expect(dispatchSpy).toHaveBeenCalledWith(
       'op-save-fail',
       'onComplete',
@@ -1294,8 +1286,8 @@ describe('AgentRuntimeService.executeStep - Redis failure in error handler', () 
         operationId: 'op-save-fail',
         reason: 'error',
         finalState: expect.objectContaining({
-          metadata: expect.objectContaining({
-            _hooks: expect.arrayContaining([
+          host: expect.objectContaining({
+            hooks: expect.arrayContaining([
               expect.objectContaining({
                 id: 'test-hook',
                 webhook: { url: 'https://example.com/webhook' },
@@ -1356,7 +1348,7 @@ describe('AgentRuntimeService.executeStep - error-path snapshot finalize ()', ()
     // metadata.
     coordinator.loadAgentState = vi.fn().mockResolvedValue({
       lastModified: new Date().toISOString(),
-      metadata: { agentId: 'agt-1', topicId: 'tpc-1', userId: 'user-1' },
+      origin: { agentId: 'agt-1', topicId: 'tpc-1', userId: 'user-1' },
       status: 'running',
       stepCount: 1,
     });
@@ -1496,7 +1488,7 @@ describe('AgentRuntimeService.executeStep - error-path snapshot finalize ()', ()
     streamManager.publishStreamEvent = vi.fn().mockResolvedValue(undefined);
     coordinator.loadAgentState = vi.fn().mockResolvedValue({
       lastModified: new Date().toISOString(),
-      metadata: { agentId: 'agt-1', topicId: 'tpc-1', userId: 'user-1' },
+      origin: { agentId: 'agt-1', topicId: 'tpc-1', userId: 'user-1' },
       status: 'running',
       stepCount: 1,
     });
@@ -1577,7 +1569,7 @@ describe('AgentRuntimeService.executeStep - error-path snapshot finalize ()', ()
     // not skip this attempt — we want the catch path to run.
     coordinator.loadAgentState = vi.fn().mockResolvedValue({
       lastModified: new Date().toISOString(),
-      metadata: { agentId: 'agt-1', topicId: 'tpc-1', userId: 'user-1' },
+      origin: { agentId: 'agt-1', topicId: 'tpc-1', userId: 'user-1' },
       status: 'running',
       stepCount: 1,
     });
@@ -1634,15 +1626,17 @@ describe('AgentRuntimeService.executeStep - step_start uiMessages payload', () =
       status: 'done',
       stepCount: 3,
       lastModified: new Date().toISOString(),
-      metadata: { agentId: 'agt_1', topicId: 'tpc_1' },
+      origin: { agentId: 'agt_1', topicId: 'tpc_1' },
     });
     streamManager.publishStreamEvent = vi.fn().mockResolvedValue(undefined);
 
-    // Inject a uiMessages-returning messageService — the runtime queries
-    // through MessageService (not the bare messageModel) so that file URLs
-    // go through FileService postProcessUrl.
-    const stubMessages = [{ id: 'msg_1', role: 'user' }];
+    // The DB read and UI preparation are separate boundaries. Keep their
+    // results distinct so this asserts the event carries the prepared UI view.
+    const rawMessages = [{ id: 'msg_1', role: 'user', content: 'raw' }];
+    const stubMessages = [{ id: 'msg_1', role: 'user', content: 'prepared' }];
+    (service as any).messageModel.query.mockResolvedValue(rawMessages);
     (service as any).messageServiceInstance = {
+      prepareUiMessages: vi.fn().mockResolvedValue(stubMessages),
       queryMessages: vi.fn().mockResolvedValue(stubMessages),
     };
 
@@ -1674,8 +1668,8 @@ describe('AgentRuntimeService.executeStep - step_start uiMessages payload', () =
     });
     streamManager.publishStreamEvent = vi.fn().mockResolvedValue(undefined);
 
-    const queryMock = vi.fn();
-    (service as any).messageServiceInstance = { queryMessages: queryMock };
+    const queryMock = (service as any).messageModel.query;
+    (service as any).messageServiceInstance = { prepareUiMessages: vi.fn() };
 
     await service.executeStep({
       operationId: 'op-noctx',
@@ -1690,6 +1684,70 @@ describe('AgentRuntimeService.executeStep - step_start uiMessages payload', () =
     expect(stepStartCall[1].data).not.toHaveProperty('uiMessages');
     // Did not even attempt the DB query when context is missing.
     expect(queryMock).not.toHaveBeenCalled();
+  });
+
+  it('sends only the expected revision when the client declared protocol 2', async () => {
+    const service = new AgentRuntimeService({} as any, 'user-1', { queueService: null });
+    const coordinator = (service as any).coordinator;
+    const streamManager = (service as any).streamManager;
+
+    coordinator.tryClaimStep = vi.fn().mockResolvedValue(true);
+    coordinator.loadAgentState = vi.fn().mockResolvedValue({
+      host: { clientProtocol: 2 },
+      lastModified: new Date().toISOString(),
+      origin: { agentId: 'agt_1', topicId: 'tpc_1' },
+      status: 'done',
+      stepCount: 3,
+    });
+    streamManager.publishStreamEvent = vi.fn().mockResolvedValue(undefined);
+    (service as any).messageServiceInstance = {
+      prepareUiMessages: vi.fn().mockResolvedValue([{ id: 'large-history', role: 'user' }]),
+    };
+
+    await service.executeStep({
+      context: { phase: 'user_input' } as any,
+      operationId: 'op-patch',
+      stepIndex: 5,
+    });
+
+    const stepStartCall = streamManager.publishStreamEvent.mock.calls.find(
+      ([, evt]: any) => evt?.type === 'step_start',
+    );
+    expect(stepStartCall[1].data).toEqual({ llmCalls: 0, messageRevision: 5 });
+  });
+
+  it('still pushes the whole snapshot to a client that declared nothing', async () => {
+    const service = new AgentRuntimeService({} as any, 'user-1', { queueService: null });
+    const coordinator = (service as any).coordinator;
+    const streamManager = (service as any).streamManager;
+
+    coordinator.tryClaimStep = vi.fn().mockResolvedValue(true);
+    coordinator.loadAgentState = vi.fn().mockResolvedValue({
+      // An older desktop bundle: it only learns the settled list from what the
+      // server pushes, so a revision alone would leave it rendering stale rows.
+      host: {},
+      lastModified: new Date().toISOString(),
+      origin: { agentId: 'agt_1', topicId: 'tpc_1' },
+      status: 'done',
+      stepCount: 3,
+    });
+    streamManager.publishStreamEvent = vi.fn().mockResolvedValue(undefined);
+    (service as any).messageServiceInstance = {
+      prepareUiMessages: vi.fn().mockResolvedValue([{ id: 'large-history', role: 'user' }]),
+    };
+
+    await service.executeStep({
+      context: { phase: 'user_input' } as any,
+      operationId: 'op-legacy',
+      stepIndex: 5,
+    });
+
+    const stepStartCall = streamManager.publishStreamEvent.mock.calls.find(
+      ([, evt]: any) => evt?.type === 'step_start',
+    );
+    expect(stepStartCall[1].data).toMatchObject({
+      uiMessages: [{ id: 'large-history', role: 'user' }],
+    });
   });
 });
 
@@ -1775,7 +1833,7 @@ describe('AgentRuntimeService.executeStep - Agent Share authorization revoked mi
 
     const agentState = {
       lastModified: new Date().toISOString(),
-      metadata: { agentShareVisitor: { agentId: 'agent-1', shareId: 'share-1' } },
+      principal: { actor: { shareVisitor: { agentId: 'agent-1', shareId: 'share-1' } } },
       status: 'running',
       stepCount: 3,
     };
@@ -1826,5 +1884,88 @@ describe('AgentRuntimeService.executeStep - Agent Share authorization revoked mi
 
     emitSignalEvents.mockRestore();
     dispatchHooks.mockRestore();
+  });
+});
+
+describe('AgentRuntimeService.executeStep - queued messages flag', () => {
+  const runStep = async (
+    readFlag: () => Promise<boolean>,
+    context: Record<string, unknown> = { payload: {}, phase: 'tools_batch_result' },
+  ) => {
+    const service = new AgentRuntimeService({} as any, 'user-1', { queueService: null });
+    const coordinator = (service as any).coordinator;
+    coordinator.loadAgentState = vi.fn().mockResolvedValue({
+      lastModified: new Date().toISOString(),
+      metadata: {},
+      status: 'running',
+      stepCount: 1,
+    });
+    coordinator.hasQueuedMessages = vi.fn(readFlag);
+    vi.spyOn((service as any).completionLifecycle, 'registerFileWorks').mockResolvedValue(
+      undefined,
+    );
+    vi.spyOn((service as any).completionLifecycle, 'emitSignalEvents').mockResolvedValue([]);
+    vi.spyOn((service as any).completionLifecycle, 'dispatchHooks').mockResolvedValue(undefined);
+    const step = vi.fn().mockResolvedValue({
+      events: [],
+      newState: {
+        lastModified: new Date().toISOString(),
+        messages: [],
+        metadata: {},
+        status: 'done',
+        stepCount: 2,
+      },
+      nextContext: undefined,
+    });
+    (service as any).createAgentRuntime = vi.fn().mockResolvedValue({ runtime: { step } });
+
+    await service.executeStep({
+      context: context as any,
+      operationId: 'op-queued',
+      stepIndex: 1,
+    });
+
+    return { hasQueuedMessages: coordinator.hasQueuedMessages, step };
+  };
+
+  // Regression: queued follow-ups only ever reached the step context in the
+  // browser runtime, so a server run never took the agent's early hand-back
+  // and the follow-up waited for every remaining step.
+  it('hands the flag to the agent through the step context', async () => {
+    const { hasQueuedMessages, step } = await runStep(async () => true);
+
+    expect(hasQueuedMessages).toHaveBeenCalledWith('op-queued');
+    expect(step.mock.calls[0][1].stepContext).toEqual(
+      expect.objectContaining({ hasQueuedMessages: true }),
+    );
+  });
+
+  // Regression: the flag was only ever added, so a context that arrived still
+  // carrying `true` kept ending the turn after the user emptied the queue.
+  it('drops a carried-in flag once the queue is empty', async () => {
+    const { step } = await runStep(async () => false, {
+      payload: {},
+      phase: 'tools_batch_result',
+      stepContext: { hasQueuedMessages: true, todos: { items: [] } },
+    });
+
+    const stepContext = step.mock.calls[0][1].stepContext;
+    expect(stepContext?.hasQueuedMessages).toBeUndefined();
+    expect(stepContext).toEqual(expect.objectContaining({ todos: { items: [] } }));
+  });
+
+  it('leaves the step context untouched when nothing is queued', async () => {
+    const { step } = await runStep(async () => false);
+
+    expect(step.mock.calls[0][1].stepContext?.hasQueuedMessages).toBeUndefined();
+  });
+
+  it('keeps the run going when the flag cannot be read', async () => {
+    const { step } = await runStep(async () => {
+      throw new Error('redis down');
+    });
+
+    expect(step).toHaveBeenCalledTimes(1);
+    expect(step.mock.calls[0][1].stepContext?.hasQueuedMessages).toBeUndefined();
   });
 });

@@ -1,8 +1,8 @@
 import { z } from 'zod';
 
-import type { ConversationContext } from '../../conversation';
 import type { UploadFileItem } from '../../files';
 import type { MessageSemanticSearchChunk } from '../../rag';
+import type { WorkingDirConfig } from '../../workingDir';
 import type { ChatMessageError } from '../common/base';
 import { ChatMessageErrorSchema } from '../common/base';
 import type {
@@ -159,6 +159,12 @@ export interface SendMessageParams {
    */
   metadata?: Record<string, any>;
 
+  /**
+   * The working directory a topic this send creates runs in, prepared by the
+   * composer right before sending (a worktree it just created). Ignored when
+   * the send lands in an existing topic, whose directory is its own.
+   */
+  newTopicWorkingDirectory?: WorkingDirConfig;
   onlyAddUserMessage?: boolean;
   /**
    * Called once the send lifecycle owns the turn, either by persisting the user message or by
@@ -194,25 +200,16 @@ export interface SendMessageParams {
    */
   preserveComposer?: boolean;
   /**
+   * The head of a queue sent one message per turn (Follow-up behavior: Queue).
+   * The rest of that queue waits behind this send instead of joining it.
+   */
+  queueHead?: boolean;
+  /**
    * Cancels the send before the conversation lifecycle accepts ownership of the turn.
    * Once `onMessageAccepted` fires, later aborts are ignored and the existing runtime Stop flow
    * owns any subsequent model execution.
    */
   signal?: AbortSignal;
-}
-
-export interface SendGroupMessageParams {
-  context: ConversationContext;
-  files?: UploadFileItem[];
-  message: string;
-  /**
-   * Additional metadata for the message (e.g., mentioned users)
-   */
-  metadata?: Record<string, any>;
-  /**
-   * for group chat
-   */
-  targetMemberId?: string | null;
 }
 
 // ========== Zod Schemas ========== //

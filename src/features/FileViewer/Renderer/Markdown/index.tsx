@@ -1,15 +1,24 @@
 'use client';
 
-import { Center, Flexbox, Highlighter, Icon, Markdown } from '@lobehub/ui';
-import { Tabs } from '@lobehub/ui/base-ui';
-import { createStaticStyles, cssVar } from 'antd-style';
+import {
+  Center,
+  createStaticStyles,
+  cssVar,
+  Flexbox,
+  Highlighter,
+  Icon,
+  Markdown,
+  Spin,
+  Tabs,
+} from '@lobehub/ui';
 import { CodeIcon, EyeIcon } from 'lucide-react';
 import { memo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import NeuralNetworkLoading from '@/components/NeuralNetworkLoading';
+import AsyncError from '@/components/AsyncError';
 
 import { useTextFileLoader } from '../../hooks/useTextFileLoader';
+import NotSupport from '../../NotSupport';
 
 const styles = createStaticStyles(({ css }) => ({
   // Same floating-controls treatment as the LocalFile portal's text preview, so
@@ -57,13 +66,21 @@ interface MarkdownViewerProps {
  */
 const MarkdownViewer = memo<MarkdownViewerProps>(({ url }) => {
   const { t } = useTranslation('file');
-  const { fileData, loading } = useTextFileLoader(url);
+  const { error, fileData, loading, tooLarge } = useTextFileLoader(url);
   const [mode, setMode] = useState<PreviewMode>('render');
+
+  if (!loading && fileData === null)
+    return (
+      <Flexbox>
+        {error && <AsyncError error={error} variant={'block'} />}
+        <NotSupport tooLarge={tooLarge} url={url} />
+      </Flexbox>
+    );
 
   if (loading || fileData === null)
     return (
       <Center height={'100%'} width={'100%'}>
-        <NeuralNetworkLoading size={36} />
+        <Spin size="large" />
       </Center>
     );
 
@@ -81,9 +98,21 @@ const MarkdownViewer = memo<MarkdownViewerProps>(({ url }) => {
         />
       </Flexbox>
       {mode === 'render' ? (
-        <Markdown style={{ paddingBlock: 16, paddingInline: 24 }}>{fileData}</Markdown>
+        // `flex: none` keeps the article at its full height; as a shrinkable
+        // flex item it was squeezed to the page and its `overflow: hidden` cut
+        // the rest off, so the page had nothing to scroll.
+        <Markdown style={{ flex: 'none', paddingBlock: 16, paddingInline: 24 }}>
+          {fileData}
+        </Markdown>
       ) : (
-        <Highlighter language={'markdown'} showLanguage={false} variant={'borderless'}>
+        // The source scrolls inside the highlighter, so its horizontal scrollbar
+        // stays in view; the inset matches `Renderer/Code`.
+        <Highlighter
+          language={'markdown'}
+          showLanguage={false}
+          style={{ paddingBlock: 16, paddingInline: '24px 4px' }}
+          variant={'borderless'}
+        >
           {fileData}
         </Highlighter>
       )}

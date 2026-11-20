@@ -1,27 +1,32 @@
 'use client';
 
 import type { AcceptanceCommentItem } from '@lobechat/types';
-import { Flexbox, Icon } from '@lobehub/ui';
-import type { DropdownItem } from '@lobehub/ui/base-ui';
+import type { DropdownItem } from '@lobehub/ui';
 import {
   ActionIcon,
   Avatar,
   confirmModal,
   DropdownMenu,
+  Flexbox,
+  Icon,
   Tag,
   Text,
   toast,
-} from '@lobehub/ui/base-ui';
+} from '@lobehub/ui';
+import * as stylex from '@stylexjs/stylex';
 import { Link2, MoreHorizontal, Trash2 } from 'lucide-react';
 import { memo, type ReactNode, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import { useAcceptanceOrigin } from '@/features/Acceptance/origin';
 import { useActivityTime } from '@/hooks/useActivityTime';
+import { useUserStore } from '@/store/user';
+import { userProfileSelectors } from '@/store/user/selectors';
 
-import { AttachmentThumbs } from '../Evidence/attachments';
 import { commentAnchorUrl } from './anchor';
+import CommentContent from './CommentContent';
 import CommentReactions from './CommentReactions';
-import { styles } from './styles';
+import { styles, TIMELINE_NODE } from './styles';
 
 export const commentAuthorName = (author: AcceptanceCommentItem['author']) =>
   author.fullName || author.username || '—';
@@ -63,8 +68,9 @@ interface CommentCardProps {
   /**
    * `boxed` is the discussion message: a header strip over the body.
    * `plain` is the floating note: the same content with no frame of its own.
+   * `feed` is the discussion feed: an author line, the words indented under it.
    */
-  variant?: 'boxed' | 'plain';
+  variant?: 'boxed' | 'feed' | 'plain';
 }
 
 /** One remark: who, when, what — and the author's own actions behind a menu. */
@@ -81,8 +87,21 @@ const CommentCard = memo<CommentCardProps>(
   }) => {
     const { t } = useTranslation('verify');
     const time = useActivityTime(comment.createdAt);
+    const appOrigin = useAcceptanceOrigin();
     const [deleting, setDeleting] = useState(false);
     const name = nameOverride ?? commentAuthorName(comment.author);
+    const viewerId = useUserStore(userProfileSelectors.userId);
+    const own = Boolean(viewerId) && comment.authorUserId === viewerId;
+
+    const copyAnchor = async () => {
+      try {
+        await navigator.clipboard.writeText(commentAnchorUrl(comment.id, appOrigin));
+        toast.success(t('acceptance.comments.linkCopied'));
+      } catch (cause) {
+        console.error('[acceptance:comments]', cause);
+        toast.error(t('acceptance.comments.updateFailed'));
+      }
+    };
 
     const menuItems: DropdownItem[] = [
       ...(anchored
@@ -91,15 +110,7 @@ const CommentCard = memo<CommentCardProps>(
               icon: <Icon icon={Link2} />,
               key: 'copy-link',
               label: t('acceptance.comments.copyLink'),
-              onClick: async () => {
-                try {
-                  await navigator.clipboard.writeText(commentAnchorUrl(comment.id));
-                  toast.success(t('acceptance.comments.linkCopied'));
-                } catch (cause) {
-                  console.error('[acceptance:comments]', cause);
-                  toast.error(t('acceptance.comments.updateFailed'));
-                }
-              },
+              onClick: copyAnchor,
             } satisfies DropdownItem,
           ]
         : []),
@@ -109,12 +120,18 @@ const CommentCard = memo<CommentCardProps>(
               danger: true,
               icon: <Icon icon={Trash2} />,
               key: 'delete',
-              label: t('acceptance.comments.delete'),
+              // Taking down someone else's remark is a different act from
+              // deleting your own, and the confirm says which one this is.
+              label: own ? t('acceptance.comments.delete') : t('acceptance.comments.removeOthers'),
               onClick: () =>
                 confirmModal({
-                  content: t('acceptance.comments.deleteConfirm'),
+                  content: own
+                    ? t('acceptance.comments.deleteConfirm')
+                    : t('acceptance.comments.removeOthersConfirm'),
                   okButtonProps: { danger: true },
-                  okText: t('acceptance.comments.delete'),
+                  okText: own
+                    ? t('acceptance.comments.delete')
+                    : t('acceptance.comments.removeOthers'),
                   onOk: async () => {
                     setDeleting(true);
                     try {
@@ -137,15 +154,16 @@ const CommentCard = memo<CommentCardProps>(
         <Flexbox
           horizontal
           align={'center'}
-          className={variant === 'boxed' ? styles.boxHeader : undefined}
           gap={8}
           wrap={'wrap'}
+          {...stylex.props(variant === 'boxed' && styles.boxHeader)}
         >
           {variant === 'plain' && <CommentAvatar comment={comment} size={18} />}
+          {variant === 'feed' && <CommentAvatar comment={comment} size={TIMELINE_NODE} />}
           <Text
-            className={nameOverride ? styles.headline : styles.authorName}
-            fontSize={13}
+            fontSize={14}
             weight={600}
+            {...stylex.props(nameOverride ? styles.headline : styles.authorName)}
           >
             {name}
           </Text>
@@ -155,12 +173,33 @@ const CommentCard = memo<CommentCardProps>(
           {comment.author.status !== 'active' && (
             <Tag size={'small'}>{t(`acceptance.comments.author.${comment.author.status}`)}</Tag>
           )}
-          <span className={styles.meta} title={time.title}>
-            {nameOverride ? time.text : t('acceptance.comments.commented', { time: time.text })}
-          </span>
+          {anchored ? (
+            /*
+             * The timestamp IS the permalink, the way every threaded discussion
+             * has trained people to expect: it is the one part of a remark that
+             * belongs to that remark alone. Clicking copies its address instead
+             * of navigating — the reader is already looking at it, and what they
+             * want is the link to paste somewhere else.
+             */
+            <button
+              {...stylex.props(styles.meta, styles.timeLink)}
+              title={t('acceptance.comments.copyLinkHint', { time: time.title })}
+              type={'button'}
+              onClick={(event) => {
+                event.stopPropagation();
+                void copyAnchor();
+              }}
+            >
+              {nameOverride ? time.text : t('acceptance.comments.commented', { time: time.text })}
+            </button>
+          ) : (
+            <span {...stylex.props(styles.meta)} title={time.title}>
+              {nameOverride ? time.text : t('acceptance.comments.commented', { time: time.text })}
+            </span>
+          )}
           {badges}
           {menuItems.length > 0 && (
-            <div data-comment-actions className={styles.rowActions}>
+            <div {...stylex.props(styles.rowActions)}>
               <DropdownMenu
                 items={menuItems}
                 placement={'bottomRight'}
@@ -176,18 +215,16 @@ const CommentCard = memo<CommentCardProps>(
             </div>
           )}
         </Flexbox>
-        <div className={variant === 'boxed' ? styles.body : styles.panelBody}>
-          {comment.deletedAt ? (
-            <span className={styles.deleted}>{t('acceptance.comments.deleted')}</span>
-          ) : (
-            comment.content
+        <div
+          {...stylex.props(
+            variant === 'boxed'
+              ? styles.body
+              : variant === 'feed'
+                ? styles.feedBody
+                : styles.panelBody,
           )}
-          {/* Exhibits, under the words rather than inside them. */}
-          {comment.attachments.length > 0 && (
-            <div className={styles.attachments}>
-              <AttachmentThumbs attachments={comment.attachments} />
-            </div>
-          )}
+        >
+          <CommentContent comment={comment} />
           {onReact && (
             <CommentReactions
               reactions={comment.reactions}

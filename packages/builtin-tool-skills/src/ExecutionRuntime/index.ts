@@ -1,4 +1,4 @@
-import { AGENT_SKILLS_IDENTIFIER_PREFIX } from '@lobechat/const';
+import { AGENT_SKILLS_IDENTIFIER_PREFIX, USER_SKILLS_IDENTIFIER_PREFIX } from '@lobechat/const';
 import {
   formatCommandResult,
   formatSandboxRecreation,
@@ -34,6 +34,8 @@ export interface SkillImportServiceResult {
 }
 
 export interface ExportFileResult {
+  /** Preserve upstream failures for the outer tool error classifier. */
+  error?: unknown;
   fileId?: string;
   filename: string;
   mimeType?: string;
@@ -42,10 +44,31 @@ export interface ExportFileResult {
   url?: string;
 }
 
+/**
+ * Host-resolved execution settings for one `execScript` call. Supplied by the
+ * caller that owns the run (the client executor from its tool context), never
+ * by the model — the manifest exposes none of these.
+ */
+export interface ExecScriptExecutionOptions {
+  /**
+   * Confine the command in the device sandbox (the "Local Sandbox" execution
+   * environment), with the same semantics as `local-system.runCommand`.
+   */
+  localSandbox?: boolean;
+  /** Let a fenced command reach the package-registry allowlist. */
+  localSandboxNetwork?: boolean;
+  /**
+   * The agent's working directory: the fence root of a sandboxed run (the
+   * skill directory is the shared skill cache and stays outside the fence),
+   * and its cwd when no skill directory resolves.
+   */
+  workingDirectory?: string;
+}
+
 export interface SkillRuntimeService {
   execScript?: (
     command: string,
-    options: {
+    options: ExecScriptExecutionOptions & {
       activatedSkills?: Array<{ description?: string; id?: string; name: string }>;
       description: string;
     },
@@ -103,6 +126,12 @@ export interface SkillsExecutionRuntimeOptions {
   deviceFileAccess?: DeviceFileAccess;
   /** Filesystem skills discovered on the execution device. */
   projectSkills?: ProjectSkillRuntimeItem[];
+  /**
+   * Resolves a skill by name when it is not among `builtinSkills`: a library
+   * too large to load up front (the user's own skills) is read on demand, only
+   * for the name a call asks for.
+   */
+  resolveSkill?: (name: string) => Promise<BuiltinSkill | undefined>;
   service: SkillRuntimeService;
 }
 
@@ -165,6 +194,7 @@ export class SkillsExecutionRuntime {
   private builtinSkills: BuiltinSkill[];
   private projectSkills: ProjectSkillRuntimeItem[];
   private deviceFileAccess?: DeviceFileAccess;
+  private resolveSkill?: (name: string) => Promise<BuiltinSkill | undefined>;
   private service: SkillRuntimeService;
 
   constructor(options: SkillsExecutionRuntimeOptions) {
@@ -173,9 +203,22 @@ export class SkillsExecutionRuntime {
     this.builtinSkills = options.builtinSkills || [];
     this.projectSkills = options.projectSkills || [];
     this.deviceFileAccess = options.deviceFileAccess;
+    this.resolveSkill = options.resolveSkill;
   }
 
-  async execScript(args: ExecScriptParams): Promise<BuiltinServerRuntimeOutput> {
+  /** A preloaded builtin-shaped skill, else one the resolver reads on demand. */
+  private findBuiltinSkill = async (name: string): Promise<BuiltinSkill | undefined> => {
+    const preloaded = findByNameCI(this.builtinSkills, name);
+    if (preloaded || !this.resolveSkill) return preloaded;
+    const resolved = await this.resolveSkill(name);
+    if (resolved) this.builtinSkills = [...this.builtinSkills, resolved];
+    return resolved;
+  };
+
+  async execScript(
+    args: ExecScriptParams,
+    execution?: ExecScriptExecutionOptions,
+  ): Promise<BuiltinServerRuntimeOutput> {
     const { command, description } = args;
     // Args win when the caller (client executor) already injected stepContext;
     // the constructor option covers the server path where args are raw LLM output.
@@ -185,6 +228,7 @@ export class SkillsExecutionRuntime {
     if (this.service.execScript) {
       try {
         const result = await this.service.execScript(command, {
+          ...execution,
           activatedSkills,
           description,
         });
@@ -254,6 +298,7 @@ export class SkillsExecutionRuntime {
       if (!result.success) {
         return {
           content: `Failed to export file: ${filename}`,
+          error: result.error,
           success: false,
         };
       }
@@ -362,7 +407,7 @@ export class SkillsExecutionRuntime {
 
       // Fall back to builtin skills (includes agent-document skill bundles
       // via the `agent-skills:` identifier prefix).
-      const builtinSkill = findByNameCI(this.builtinSkills, id);
+      const builtinSkill = await this.findBuiltinSkill(id);
       if (builtinSkill?.resources) {
         const meta = builtinSkill.resources[path];
         if (meta?.content !== undefined) {
@@ -467,7 +512,7 @@ export class SkillsExecutionRuntime {
 
     // Fall back to builtin skills (includes agent-document skill bundles via
     // the `agent-skills:` identifier prefix).
-    const builtinSkill = findByNameCI(this.builtinSkills, name);
+    const builtinSkill = await this.findBuiltinSkill(name);
     if (builtinSkill) {
       let content = builtinSkill.content;
       const hasResources = !!(
@@ -483,6 +528,8 @@ export class SkillsExecutionRuntime {
       // inspector can pick the right label ("Activate Agent Skill") and prefer
       // the friendly `title` over the raw `agent-skills:<filename>` name.
       const isAgentSkill = builtinSkill.identifier.startsWith(AGENT_SKILLS_IDENTIFIER_PREFIX);
+      // The user's own skill library rides the same path under `user-skills:`.
+      const isUserSkill = builtinSkill.identifier.startsWith(USER_SKILLS_IDENTIFIER_PREFIX);
 
       return {
         content,
@@ -491,7 +538,7 @@ export class SkillsExecutionRuntime {
           hasResources,
           identifier: builtinSkill.identifier,
           name: builtinSkill.name,
-          source: isAgentSkill ? 'agent' : 'builtin',
+          source: isAgentSkill ? 'agent' : isUserSkill ? 'user' : 'builtin',
           ...(builtinSkill.title && { title: builtinSkill.title }),
         },
         success: true,
@@ -530,6 +577,7 @@ export class SkillsExecutionRuntime {
 
     return {
       content: formatSandboxRecreation(content, result.sessionExpiredAndRecreated),
+      error: result.error,
       state: {
         command,
         ...(result.sessionExpiredAndRecreated && { sessionExpiredAndRecreated: true }),

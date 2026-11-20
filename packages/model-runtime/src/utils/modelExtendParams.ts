@@ -82,15 +82,16 @@ export interface ModelExtendParams {
 }
 
 type ThinkingLevelExtendParam =
-  'thinkingLevel' | 'thinkingLevel2' | 'thinkingLevel3' | 'thinkingLevel4';
+  'thinkingLevel' | 'thinkingLevel2' | 'thinkingLevel3' | 'thinkingLevel4' | 'thinkingLevel5';
 
-type ThinkingLevelValue = NonNullable<LobeAgentChatConfig['thinkingLevel']>;
+type ThinkingLevelValue = NonNullable<LobeAgentChatConfig[ThinkingLevelExtendParam]>;
 
 const DEFAULT_THINKING_LEVEL_BY_EXTEND_PARAM = {
   thinkingLevel: 'high',
   thinkingLevel2: 'high',
   thinkingLevel3: 'high',
   thinkingLevel4: 'minimal',
+  thinkingLevel5: 'high',
 } as const satisfies Record<ThinkingLevelExtendParam, ThinkingLevelValue>;
 
 const MODEL_THINKING_LEVEL_DEFAULTS: Partial<
@@ -344,6 +345,10 @@ export const applyModelExtendParams = (ctx: ApplyModelExtendParamsContext): Mode
 
   if (modelExtendParams.includes('grok4_6ReasoningEffort') && chatConfig.grok4_6ReasoningEffort) {
     extendParams.reasoning_effort = chatConfig.grok4_6ReasoningEffort;
+  }
+
+  if (modelExtendParams.includes('grok4_7ReasoningEffort') && chatConfig.grok4_7ReasoningEffort) {
+    extendParams.reasoning_effort = chatConfig.grok4_7ReasoningEffort;
   }
 
   if (modelExtendParams.includes('hy3ReasoningEffort') && chatConfig.hy3ReasoningEffort) {

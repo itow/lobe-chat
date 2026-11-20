@@ -1,8 +1,8 @@
 // @vitest-environment node
 import { type LobeChatDatabase } from '@lobechat/database';
-import { messages, sessions, topics } from '@lobechat/database/schemas';
+import { messages, sessions, topics, trashItems } from '@lobechat/database/schemas';
 import { getTestDB } from '@lobechat/database/test-utils';
-import { eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { topicRouter } from '../../topic';
@@ -20,7 +20,17 @@ vi.mock('@/server/utils/scheduleAfterResponse', () => ({
   after: vi.fn(function (callback: () => void) {
     return callback();
   }),
+  // Trash / archive hand the worktree cleanup to the host; nothing to run here.
+  afterUnscoped: vi.fn(),
 }));
+
+const legacyInboxTopic = (userId: string): typeof topics.$inferInsert => ({
+  title: 'Legacy Inbox Topic',
+  sessionId: null,
+  groupId: null,
+  agentId: null,
+  userId,
+});
 
 /**
  * Topic Router Integration Tests
@@ -284,6 +294,16 @@ describe('Topic Router Integration Tests', () => {
         })
         .returning();
 
+      // A native agent Session has a real relationship. An unlinked shell
+      // cannot serve as an Agent alias.
+      const { agentsToSessions } = await import('@/database/schemas');
+      const anotherAgentId = await createTestAgent(serverDB, userId);
+      await serverDB.insert(agentsToSessions).values({
+        agentId: anotherAgentId,
+        sessionId: anotherSession.id,
+        userId,
+      });
+
       const result = await caller.batchCreateTopics([
         { title: 'Topic with agentId', agentId: testAgentId },
         { title: 'Topic with sessionId', sessionId: anotherSession.id },
@@ -396,12 +416,20 @@ describe('Topic Router Integration Tests', () => {
         agentId: testAgentId,
       });
 
-      const remainingTopics = await serverDB
+      // Recycle bin: rows are stamped (hidden from reads), not dropped, and
+      // each one is registered as its own restorable root.
+      const liveTopics = await serverDB
+        .select()
+        .from(topics)
+        .where(and(eq(topics.sessionId, testSessionId), isNull(topics.deletedAt)));
+      expect(liveTopics).toHaveLength(0);
+      const stamped = await serverDB
         .select()
         .from(topics)
         .where(eq(topics.sessionId, testSessionId));
-
-      expect(remainingTopics).toHaveLength(0);
+      expect(stamped).toHaveLength(2);
+      expect(await serverDB.select().from(trashItems)).toHaveLength(2);
+      expect((await caller.getTopics({ agentId: testAgentId })).items).toHaveLength(0);
     });
 
     it('should batch delete topics using sessionId', async () => {
@@ -421,7 +449,7 @@ describe('Topic Router Integration Tests', () => {
       const remainingTopics = await serverDB
         .select()
         .from(topics)
-        .where(eq(topics.sessionId, testSessionId));
+        .where(and(eq(topics.sessionId, testSessionId), isNull(topics.deletedAt)));
 
       expect(remainingTopics).toHaveLength(0);
     });
@@ -442,7 +470,10 @@ describe('Topic Router Integration Tests', () => {
         agentId: testAgentId,
       });
 
-      const remainingTopics = await serverDB.select().from(topics).where(eq(topics.userId, userId));
+      const remainingTopics = await serverDB
+        .select()
+        .from(topics)
+        .where(and(eq(topics.userId, userId), isNull(topics.deletedAt)));
 
       expect(remainingTopics).toHaveLength(0);
     });
@@ -664,13 +695,7 @@ describe('Topic Router Integration Tests', () => {
       const caller = topicRouter.createCaller(createTestContext(userId));
 
       // Insert legacy inbox topic (sessionId IS NULL, groupId IS NULL, agentId IS NULL)
-      await serverDB.insert(topics).values({
-        title: 'Legacy Inbox Topic',
-        sessionId: null,
-        groupId: null,
-        agentId: null,
-        userId,
-      });
+      await serverDB.insert(topics).values(legacyInboxTopic(userId));
 
       // Query with isInbox=true
       const result = await caller.getTopics({
@@ -686,13 +711,7 @@ describe('Topic Router Integration Tests', () => {
       const caller = topicRouter.createCaller(createTestContext(userId));
 
       // Insert legacy inbox topic
-      await serverDB.insert(topics).values({
-        title: 'Legacy Inbox Topic',
-        sessionId: null,
-        groupId: null,
-        agentId: null,
-        userId,
-      });
+      await serverDB.insert(topics).values(legacyInboxTopic(userId));
 
       // Insert new inbox topic with agentId
       await serverDB.insert(topics).values({
@@ -741,13 +760,7 @@ describe('Topic Router Integration Tests', () => {
       const caller = topicRouter.createCaller(createTestContext(userId));
 
       // Insert legacy inbox topic
-      await serverDB.insert(topics).values({
-        title: 'Legacy Inbox Topic',
-        sessionId: null,
-        groupId: null,
-        agentId: null,
-        userId,
-      });
+      await serverDB.insert(topics).values(legacyInboxTopic(userId));
 
       // Query without isInbox (default is false/undefined)
       // Using testAgentId instead since it has a proper session mapping
@@ -831,7 +844,7 @@ describe('Topic Router Integration Tests', () => {
       const remainingTopics = await serverDB
         .select()
         .from(topics)
-        .where(eq(topics.sessionId, testSessionId));
+        .where(and(eq(topics.sessionId, testSessionId), isNull(topics.deletedAt)));
 
       expect(remainingTopics).toHaveLength(1);
       expect(remainingTopics[0].title).toBe('Topic 3');
@@ -847,9 +860,15 @@ describe('Topic Router Integration Tests', () => {
 
       await caller.removeTopic({ id: topicId });
 
-      const deletedTopic = await serverDB.select().from(topics).where(eq(topics.id, topicId));
-
-      expect(deletedTopic).toHaveLength(0);
+      // Moved to the recycle bin: still on disk with a stamp, invisible to reads.
+      const [trashed] = await serverDB.select().from(topics).where(eq(topics.id, topicId));
+      expect(trashed.deletedAt).toBeTruthy();
+      expect(await caller.getTopics({ agentId: testAgentId })).toMatchObject({ items: [] });
+      const [registry] = await serverDB
+        .select()
+        .from(trashItems)
+        .where(eq(trashItems.resourceId, topicId));
+      expect(registry).toMatchObject({ resourceType: 'topic', rootId: null, userId });
     });
 
     it('should count topics', async () => {

@@ -1,28 +1,66 @@
 import { CUSTOM_FOLDER_FILE_TYPE } from '@lobechat/const';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { sortTreeItems, toTreeItem, TreeActionImpl } from './actions';
+import { hierarchySearchResource } from '@/features/ResourceManager/store/projection';
+import type * as ReplicaModule from '@/libs/replica';
+import { createReplicaState } from '@/libs/replica';
+import { SortType } from '@/types/files';
+
+import {
+  isExpandable,
+  sortTreeItems,
+  toTreeItem,
+  toTreeItemFromResource,
+  TreeActionImpl,
+} from './actions';
 import type { TreeState } from './types';
 
 const {
+  mockApplyMovedResourceToCaches,
+  mockCollapseHierarchySearch,
   mockDeleteResources,
   mockGetKnowledgeItems,
+  mockPatchSearchHit,
   mockRefreshFileList,
   mockResourceMove,
+  mockRevalidateReplica,
+  mockSetSort,
+  mockReorder,
   mockStoreMove,
-  mockSwrMutate,
   mockUpdateResource,
 } = vi.hoisted(() => ({
+  mockApplyMovedResourceToCaches: vi.fn(),
+  mockCollapseHierarchySearch: vi.fn(),
   mockDeleteResources: vi.fn(),
   mockGetKnowledgeItems: vi.fn(),
+  mockPatchSearchHit: vi.fn(),
   mockRefreshFileList: vi.fn(),
   mockResourceMove: vi.fn(),
+  mockRevalidateReplica: vi.fn(),
+  mockSetSort: vi.fn(),
+  mockReorder: vi.fn(),
   mockStoreMove: vi.fn(),
-  mockSwrMutate: vi.fn(),
   mockUpdateResource: vi.fn(),
 }));
 
-vi.mock('swr', () => ({ mutate: mockSwrMutate }));
+vi.mock('@/libs/replica', async () => ({
+  ...(await vi.importActual<typeof ReplicaModule>('@/libs/replica')),
+  revalidateReplica: mockRevalidateReplica,
+}));
+
+vi.mock('@/features/ResourceManager/store', () => ({
+  useResourceManagerStore: {
+    getState: () => ({
+      setSort: mockSetSort,
+      collapseHierarchySearch: mockCollapseHierarchySearch,
+      patchSearchHit: mockPatchSearchHit,
+    }),
+  },
+}));
+
+vi.mock('@/services/knowledgeBase', () => ({
+  knowledgeBaseService: { reorderKnowledgeItems: mockReorder },
+}));
 
 vi.mock('@/services/file', () => ({
   fileService: {
@@ -30,7 +68,18 @@ vi.mock('@/services/file', () => ({
   },
 }));
 
+const moveCachePatch = {
+  fromParentKeys: ['folder-a'],
+  scope: { libraryId: 'kb-1', workspaceId: 'workspace-1' },
+  toParentKeys: ['folder-b'],
+};
+
 const fileStoreState = {
+  queryParams: { libraryId: 'kb-1', parentId: null as string | null },
+  resourceList: [],
+  reorderCurrentResources: vi.fn(() => ({ commit: vi.fn(), rollback: vi.fn() })),
+  applyMovedResourceToCaches: mockApplyMovedResourceToCaches,
+  prepareResourceMoveCachePatch: vi.fn(async () => moveCachePatch),
   moveResource: mockStoreMove,
   refreshFileList: mockRefreshFileList,
   resourceMap: new Map<string, unknown>(),
@@ -51,6 +100,11 @@ vi.mock('@/store/file', () => ({
 }));
 
 const createState = (): TreeState => ({
+  sorter: 'custom',
+  sortType: SortType.Asc,
+  setTreeSort: vi.fn(),
+  reorderItems: vi.fn(),
+  revalidateLoaded: vi.fn(),
   children: {},
   dropNodes: vi.fn(),
   epoch: 0,
@@ -65,8 +119,13 @@ const createState = (): TreeState => ({
   reconcile: vi.fn(),
   removeItems: vi.fn(),
   renameItem: vi.fn(),
+  forgetLibrary: vi.fn(),
+  forgetSnapshot: vi.fn(),
   reset: vi.fn(),
+  preHydrate: vi.fn(),
   revalidate: vi.fn(),
+  snapshotMap: {},
+  snapshotReplica: createReplicaState(),
   status: {},
   toggle: vi.fn(),
 });
@@ -83,9 +142,11 @@ const createSetter = (getState: () => TreeState) => {
 
 describe('TreeActionImpl.moveItem', () => {
   beforeEach(() => {
+    mockApplyMovedResourceToCaches.mockReset();
     mockRefreshFileList.mockReset();
     mockResourceMove.mockReset();
     mockStoreMove.mockReset();
+    fileStoreState.prepareResourceMoveCachePatch.mockClear();
     fileStoreState.resourceMap = new Map();
   });
 
@@ -97,10 +158,24 @@ describe('TreeActionImpl.moveItem', () => {
     );
     const revalidateSpy = vi.spyOn(actions, 'revalidate').mockResolvedValue();
 
+    const moved = { id: 'file-1', parentId: 'folder-b' };
+    mockResourceMove.mockResolvedValue(moved);
+
     await actions.moveItem('file-1', 'folder-a', 'folder-b');
     await Promise.resolve();
 
     expect(mockResourceMove).toHaveBeenCalledWith('file-1', 'folder-b');
+    // The explorer never saw the row, so its folder-list caches are patched
+    // from the server result before the current list refreshes, with the
+    // folder keys and scope prepared before the request went out.
+    expect(fileStoreState.prepareResourceMoveCachePatch).toHaveBeenCalledWith(
+      'folder-a',
+      'folder-b',
+    );
+    expect(mockApplyMovedResourceToCaches).toHaveBeenCalledWith(moved, moveCachePatch);
+    expect(fileStoreState.prepareResourceMoveCachePatch.mock.invocationCallOrder[0]).toBeLessThan(
+      mockResourceMove.mock.invocationCallOrder[0],
+    );
     expect(mockRefreshFileList).toHaveBeenCalledTimes(1);
     expect(mockStoreMove).not.toHaveBeenCalled();
     expect(revalidateSpy).toHaveBeenCalledWith('folder-a');
@@ -121,6 +196,7 @@ describe('TreeActionImpl.moveItem', () => {
 
     expect(mockStoreMove).toHaveBeenCalledWith('file-1', 'folder-b');
     expect(mockResourceMove).not.toHaveBeenCalled();
+    expect(mockApplyMovedResourceToCaches).not.toHaveBeenCalled();
     expect(mockRefreshFileList).not.toHaveBeenCalled();
   });
 });
@@ -231,25 +307,25 @@ describe('TreeActionImpl folder key resolution', () => {
     expect(state.children['docs_unloaded']).toEqual([doc]);
   });
 
-  it('revalidate also refreshes the hierarchy-scoped search caches', async () => {
+  it('revalidate drops the sidebar search depth and refreshes the replica', async () => {
     const state = createState();
     const actions = new TreeActionImpl(
       createSetter(() => state),
       () => state,
     );
-    mockSwrMutate.mockClear();
+    mockCollapseHierarchySearch.mockClear();
+    mockRevalidateReplica.mockClear();
     mockGetKnowledgeItems.mockResolvedValue({ items: [] });
 
     await actions.revalidate('folder-a');
 
-    expect(mockSwrMutate).toHaveBeenCalledTimes(1);
-    const [matcher, , options] = mockSwrMutate.mock.calls[0];
-    expect(options).toEqual({ revalidate: true });
-    // Only the sidebar search entries match — not the explorer's own search.
-    expect(matcher(['resource:search', { q: 'a', scope: 'hierarchy' }, 'ws-1'])).toBe(true);
-    expect(matcher(['resource:search', { q: 'a' }, 'ws-1'])).toBe(false);
-    expect(matcher(['resource:list', { q: 'a', scope: 'hierarchy' }, 'ws-1'])).toBe(false);
-    expect(matcher('resource:search')).toBe(false);
+    // The sidebar's flat search list is a replica now; a rename/move/delete in
+    // the tree must drop the loaded search depth (so a stale tail row cannot
+    // survive) and revalidate it (so the head is fresh).
+    await vi.waitFor(() => {
+      expect(mockCollapseHierarchySearch).toHaveBeenCalled();
+      expect(mockRevalidateReplica).toHaveBeenCalledWith(hierarchySearchResource);
+    });
   });
 
   it('a revalidate requested during an in-flight root load runs once that load settles', async () => {
@@ -430,6 +506,10 @@ describe('TreeActionImpl optimistic moves (destination and other mutations)', ()
     mockRefreshFileList.mockReset();
     mockResourceMove.mockReset();
     mockStoreMove.mockReset();
+    // Reset explicitly rather than relying on the runner's `clearMocks`: the
+    // rename tests assert both a patch call and the absence of one.
+    mockPatchSearchHit.mockReset();
+    mockUpdateResource.mockReset();
     fileStoreState.resourceMap = new Map();
     mockResourceMove.mockResolvedValue({});
     mockRefreshFileList.mockResolvedValue(undefined);
@@ -480,6 +560,24 @@ describe('TreeActionImpl optimistic moves (destination and other mutations)', ()
     expect(mockUpdateResource).toHaveBeenCalledWith('doc-a', { name: 'Renamed' });
     expect(state.children['']?.find((i) => i.id === 'doc-a')?.name).toBe('Renamed');
     expect(revalidateSpy).toHaveBeenCalledWith('');
+    // Regression: the search surfaces keep their own persisted hits, so a
+    // sidebar rename has to reach them or they repaint the old name.
+    expect(mockPatchSearchHit).toHaveBeenCalledWith('doc-a', { name: 'Renamed' });
+  });
+
+  it('renameItem leaves the cached searches alone when the rename fails', async () => {
+    const state = createState();
+    state.children = { '': [folder, docA] };
+    const actions = new TreeActionImpl(
+      createSetter(() => state),
+      () => state,
+    );
+    vi.spyOn(actions, 'revalidate').mockResolvedValue();
+    mockUpdateResource.mockRejectedValue(new Error('boom'));
+
+    await withTimeout(actions.renameItem('doc-a', '', 'Renamed')).catch(() => undefined);
+
+    expect(mockPatchSearchHit).not.toHaveBeenCalled();
   });
 
   it('removeItems settles, drops the folder caches, and revalidates the parent', async () => {
@@ -614,7 +712,7 @@ describe('sortTreeItems', () => {
     toTreeItem({ createdAt, fileType: 'custom/document', id, name });
 
   it('puts a just-created page first instead of dropping it into the A-Z list', () => {
-    // LOBE-13814: creating a page inside a folder full of "<name> 周报 — 2026-Wxx"
+    // Creating a page inside a folder full of "<name> 周报 — 2026-Wxx"
     // rows landed the new "Untitled" between "TC" and "xiaojie".
     const rows = [
       doc('report-tc', 'TC 周报 — 2026-W35', '2026-08-28T02:00:00.000Z'),
@@ -622,7 +720,7 @@ describe('sortTreeItems', () => {
       doc('report-xiaojie', 'xiaojie 周报 — 2026-W35', '2026-08-29T02:00:00.000Z'),
     ];
 
-    expect(sortTreeItems(rows).map((item) => item.id)).toEqual([
+    expect(sortTreeItems(rows, 'createdAt', SortType.Desc).map((item) => item.id)).toEqual([
       'untitled',
       'report-xiaojie',
       'report-tc',
@@ -651,7 +749,11 @@ describe('sortTreeItems', () => {
       doc('stub-a', 'A stub'),
     ];
 
-    expect(sortTreeItems(rows).map((item) => item.id)).toEqual(['dated', 'stub-a', 'stub-b']);
+    expect(sortTreeItems(rows, 'createdAt', SortType.Desc).map((item) => item.id)).toEqual([
+      'dated',
+      'stub-b',
+      'stub-a',
+    ]);
   });
 
   it('breaks a createdAt tie by name', () => {
@@ -660,6 +762,225 @@ describe('sortTreeItems', () => {
       doc('a', 'Alpha', '2026-08-01T00:00:00.000Z'),
     ];
 
-    expect(sortTreeItems(rows).map((item) => item.id)).toEqual(['a', 'b']);
+    expect(sortTreeItems(rows, 'createdAt', SortType.Asc).map((item) => item.id)).toEqual([
+      'a',
+      'b',
+    ]);
+  });
+});
+
+describe('toTreeItemFromResource', () => {
+  const row = {
+    createdAt: new Date('2026-01-01T00:00:00Z'),
+    fileId: 'file-1',
+    fileType: 'custom/document',
+    id: 'docs_1',
+    metadata: { emoji: '📄' },
+    name: 'Private note',
+    parentId: null,
+    size: 12,
+    slug: 'private-note',
+    sourceType: 'document',
+    url: '',
+    userId: 'user-1',
+    visibility: 'private' as const,
+  };
+
+  it('carries the fields the sidebar and the row menu read', () => {
+    // Regression: the explorer → tree reconcile rebuilt rows from a hand-written
+    // literal that omitted these two, so every list refresh stripped the private
+    // marker off the sidebar and mis-gated publish / make-private.
+    expect(toTreeItemFromResource(row)).toMatchObject({
+      userId: 'user-1',
+      visibility: 'private',
+    });
+  });
+
+  it('keeps a workspace-shared row shared', () => {
+    expect(toTreeItemFromResource({ ...row, visibility: 'public' }).visibility).toBe('public');
+  });
+
+  it('produces the same row as the tree fetch does for the same input', () => {
+    expect(toTreeItemFromResource(row)).toEqual(toTreeItem(row));
+  });
+
+  it('keeps a document with children expandable', () => {
+    // Dropping `hasChildren` here would take the caret off a parent page on
+    // every explorer refresh.
+    const parent = toTreeItemFromResource({ ...row, hasChildren: true });
+
+    expect(parent).toMatchObject({ hasChildren: true, isFolder: false });
+    expect(isExpandable(parent)).toBe(true);
+  });
+});
+
+describe('toTreeItem hasChildren', () => {
+  const doc = { fileType: 'custom/document', id: 'docs_1', name: 'Page' };
+
+  it('carries hasChildren from the server row', () => {
+    expect(toTreeItem({ ...doc, hasChildren: true }).hasChildren).toBe(true);
+    expect(toTreeItem({ ...doc, hasChildren: false }).hasChildren).toBe(false);
+  });
+
+  it('treats folders and documents with children as expandable, leaves as not', () => {
+    expect(isExpandable(toTreeItem({ ...doc, hasChildren: true }))).toBe(true);
+    expect(isExpandable(toTreeItem(doc))).toBe(false);
+    expect(isExpandable(toTreeItem({ ...doc, fileType: CUSTOM_FOLDER_FILE_TYPE }))).toBe(true);
+  });
+});
+
+describe('TreeActionImpl sorting and reorder', () => {
+  const row = (id: string, isFolder = false) =>
+    toTreeItem({
+      id,
+      name: id,
+      fileType: isFolder ? CUSTOM_FOLDER_FILE_TYPE : 'text/plain',
+    });
+
+  beforeEach(() => {
+    mockReorder.mockReset();
+    mockSetSort.mockClear();
+    mockRefreshFileList.mockResolvedValue(undefined);
+    mockGetKnowledgeItems.mockResolvedValue({ items: [] });
+    fileStoreState.queryParams = { libraryId: 'kb-1', parentId: null };
+    fileStoreState.reorderCurrentResources.mockClear();
+  });
+
+  it('uses natural numbered names by default and keeps folders first in every mode', () => {
+    const rows = ['10_知识', '02_知识', '09_知识', '01_知识'].map((id) => row(id));
+    expect(sortTreeItems(rows).map((item) => item.id)).toEqual([
+      '01_知识',
+      '02_知识',
+      '09_知识',
+      '10_知识',
+    ]);
+    expect(sortTreeItems([row('第10章'), row('第2章')]).map((item) => item.id)).toEqual([
+      '第2章',
+      '第10章',
+    ]);
+    expect(sortTreeItems([row('10'), row('2')]).map((item) => item.id)).toEqual(['2', '10']);
+    for (const sorter of ['custom', 'name', 'size', 'createdAt'] as const) {
+      for (const direction of [SortType.Asc, SortType.Desc]) {
+        expect(sortTreeItems([row('a'), row('z', true)], sorter, direction)[0].id).toBe('z');
+      }
+    }
+  });
+
+  it('re-sorts loaded levels and sends the active order on folder expansion', async () => {
+    const state = createState();
+    state.children = { '': [row('a'), row('z')], 'level2': [row('a'), row('z')] };
+    const actions = new TreeActionImpl(
+      createSetter(() => state),
+      () => state,
+    );
+    mockGetKnowledgeItems.mockImplementation(() => new Promise(() => {}));
+    actions.setTreeSort('name', SortType.Desc);
+    expect(state.children.level2.map((item) => item.id)).toEqual(['z', 'a']);
+    void actions.loadChildren('level3');
+    expect(mockGetKnowledgeItems).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        parentId: 'level3',
+        sorter: 'name',
+        sortType: SortType.Desc,
+      }),
+    );
+  });
+
+  it.each([false, true])(
+    'optimistically reorders both surfaces and rolls back on error=%s',
+    async (fails) => {
+      const state = createState();
+      state.sorter = 'name';
+      state.sortType = SortType.Desc;
+      state.children = { '': [row('folder', true), row('a'), row('b')] };
+      const actions = new TreeActionImpl(
+        createSetter(() => state),
+        () => state,
+      );
+      let resolve!: () => void;
+      let reject!: (error: Error) => void;
+      mockReorder.mockRejectedValue(new Error('reorder failed'));
+      mockReorder.mockImplementationOnce(
+        () =>
+          new Promise<void>((yes, no) => {
+            resolve = yes;
+            reject = no;
+          }),
+      );
+      const refresh = vi.spyOn(actions, 'revalidate').mockResolvedValue();
+      const pending = actions.reorderItems('', ['b'], 'a', 'before');
+      const caught = pending.catch((error) => error);
+      await vi.waitFor(() => expect(mockReorder).toHaveBeenCalled());
+      expect(state.children[''].map((item) => item.id)).toEqual(['folder', 'b', 'a']);
+      expect(state.children[''].map((item) => item.metadata?.sortOrder)).toEqual([
+        1000, 2000, 3000,
+      ]);
+      expect(mockSetSort).toHaveBeenCalledWith('custom', SortType.Asc);
+      expect(mockReorder).toHaveBeenCalledWith({
+        knowledgeBaseId: 'kb-1',
+        parentId: null,
+        dragIds: ['b'],
+        targetId: 'a',
+        position: 'before',
+        sorter: 'name',
+        sortType: SortType.Desc,
+      });
+      const overlay = fileStoreState.reorderCurrentResources.mock.results.at(-1)!.value;
+      if (fails) {
+        reject(new Error('reorder failed'));
+        expect(await caught).toEqual(new Error('reorder failed'));
+        expect(state.children[''].map((item) => item.id)).toEqual(['folder', 'a', 'b']);
+        expect(state.children[''].every((item) => !item.metadata?.sortOrder)).toBe(true);
+        expect(overlay.rollback).toHaveBeenCalled();
+      } else {
+        resolve();
+        await pending;
+        expect(overlay.commit).toHaveBeenCalled();
+        expect(refresh).toHaveBeenCalledWith('');
+      }
+    },
+  );
+
+  it('sends only moved IDs when more than 1000 siblings are loaded', async () => {
+    const state = createState();
+    state.children = { '': Array.from({ length: 1005 }, (_, i) => row(`item-${i}`)) };
+    const actions = new TreeActionImpl(
+      createSetter(() => state),
+      () => state,
+    );
+    vi.spyOn(actions, 'revalidate').mockResolvedValue();
+    mockReorder.mockResolvedValue({ success: true });
+    await actions.reorderItems('', ['item-1004'], 'item-0', 'before');
+    expect(mockReorder).toHaveBeenCalledWith(
+      expect.objectContaining({
+        dragIds: ['item-1004'],
+        targetId: 'item-0',
+        position: 'before',
+      }),
+    );
+    expect(mockReorder.mock.calls[0][0]).not.toHaveProperty('orderedIds');
+    expect(state.children[''].map((item) => item.id)).toEqual([
+      'item-1004',
+      ...Array.from({ length: 1004 }, (_, i) => `item-${i}`),
+    ]);
+  });
+
+  it('allows only the two cross-group boundary drops', async () => {
+    const state = createState();
+    const original = [row('f1', true), row('f2', true), row('a'), row('b')];
+    state.children = { '': original };
+    const actions = new TreeActionImpl(
+      createSetter(() => state),
+      () => state,
+    );
+    vi.spyOn(actions, 'revalidate').mockResolvedValue();
+    mockReorder.mockResolvedValue({ success: true });
+    await actions.reorderItems('', ['b'], 'f1', 'before');
+    expect(mockReorder).not.toHaveBeenCalled();
+    await actions.reorderItems('', ['b'], 'f2', 'after');
+    expect(state.children[''].map((item) => item.id)).toEqual(['f1', 'f2', 'b', 'a']);
+    state.children = { '': original };
+    await actions.reorderItems('', ['f1'], 'a', 'before');
+    expect(state.children[''].map((item) => item.id)).toEqual(['f2', 'f1', 'a', 'b']);
   });
 });

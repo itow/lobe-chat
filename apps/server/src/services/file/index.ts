@@ -1,4 +1,6 @@
 import { type LobeChatDatabase, type Transaction } from '@lobechat/database';
+import type { FileAccessScope, FileSource } from '@lobechat/types';
+import { ordinaryFileAccessScope } from '@lobechat/types';
 import { inferContentTypeFromImageUrl, nanoid, uuid } from '@lobechat/utils';
 import { TRPCError } from '@trpc/server';
 import { sha256 } from 'js-sha256';
@@ -19,6 +21,18 @@ export interface FileAccessUrlItem {
   fileId?: string | null;
   id?: string | null;
   url?: string | null;
+}
+
+interface FileRecordParams {
+  fileHash: string;
+  fileType: string;
+  id?: string;
+  metadata?: Record<string, unknown>;
+  name: string;
+  size: number;
+  source?: FileItem['source'];
+  url: string;
+  visibility?: FileItem['visibility'];
 }
 
 /**
@@ -48,10 +62,44 @@ export class FileService {
   }
 
   /**
+   * Reclaims an unreferenced upload and its exclusively owned stored object.
+   *
+   * Use when:
+   * - An import fails or its final owning document is permanently deleted.
+   *
+   * Expects:
+   * - The file is in the caller's scope and matches the requested upload source.
+   *
+   * Returns:
+   * - Void; referenced files and shared objects remain intact.
+   *
+   * Call stack:
+   * AgentDocumentsService.importFile / AgentDocumentVfsService.deletePermanently
+   *   -> {@link FileService.removeUnreferencedFile}
+   *     -> {@link FileModel.deleteUnreferenced}
+   *     -> {@link FileService.deleteFile}
+   */
+  public async removeUnreferencedFile(id: string, source: FileSource): Promise<void> {
+    const file = await this.fileModel.deleteUnreferenced(id, {
+      removeGlobalFile: serverDBEnv.REMOVE_GLOBAL_FILE,
+      source,
+    });
+    // The model returns an object key only after its final file reference is removed.
+    if (file) await this.deleteFile(file.url);
+  }
+
+  /**
    * Delete files in batch
    */
   public async deleteFiles(keys: string[]) {
     return this.impl.deleteFiles(keys);
+  }
+
+  /**
+   * Up to `limit` storage keys under a prefix, in lexical order
+   */
+  public async listFileKeys(prefix: string, limit?: number): Promise<string[]> {
+    return this.impl.listFileKeys(prefix, limit);
   }
 
   /**
@@ -80,8 +128,11 @@ export class FileService {
   /**
    * Create pre-signed upload descriptor
    */
-  public async createPreSignedUpload(key: string): Promise<PreSignedUpload> {
-    return this.impl.createPreSignedUpload(key);
+  public async createPreSignedUpload(
+    key: string,
+    options?: { private?: boolean },
+  ): Promise<PreSignedUpload> {
+    return this.impl.createPreSignedUpload(key, options);
   }
 
   /**
@@ -133,6 +184,9 @@ export class FileService {
    * Get full file URL
    */
   public async getFullFileUrl(url?: string | null, expiresIn?: number): Promise<string> {
+    // Native documents keep their content in the database, not object storage.
+    if (url?.startsWith('internal://')) return '';
+
     return this.impl.getFullFileUrl(url, expiresIn);
   }
 
@@ -172,8 +226,9 @@ export class FileService {
     key: string,
     buffer: Buffer,
     contentType: string,
+    options?: { abortSignal?: AbortSignal; private?: boolean },
   ): Promise<{ key: string }> {
-    return this.impl.uploadBuffer(key, buffer, contentType);
+    return this.impl.uploadBuffer(key, buffer, contentType, options);
   }
 
   private async isStoredFileAvailable(url: string): Promise<boolean> {
@@ -195,55 +250,62 @@ export class FileService {
    * @returns File record and proxy URL
    */
   public async createFileRecord(
-    params: {
-      fileHash: string;
-      fileType: string;
-      id?: string;
-      metadata?: Record<string, unknown>;
-      name: string;
-      size: number;
-      url: string;
-    },
-    trx?: Transaction,
+    params: FileRecordParams,
   ): Promise<{ fileId: string; url: string }> {
-    // Check if hash already exists in globalFiles
-    const existingFile = await this.fileModel.checkHash(params.fileHash);
-    const { isExist } = existingFile;
-
-    let shouldRefreshGlobalFile = false;
-    if (isExist && existingFile.url && existingFile.url !== params.url) {
-      shouldRefreshGlobalFile = !(await this.isStoredFileAvailable(existingFile.url));
-    }
-
-    if (shouldRefreshGlobalFile) {
-      // Keep global hash dedup usable when the same file is uploaded again to a
-      // fresh object key after the previous storage object has been removed.
-      await this.fileModel.updateGlobalFile(params.fileHash, {
-        metadata: params.metadata,
-        url: params.url,
-      });
-    }
-
-    // Create database record
-    // If hash doesn't exist, also create globalFiles record
-    const { id } = await this.fileModel.create(
-      {
-        fileHash: params.fileHash,
-        fileType: params.fileType,
-        id: params.id, // Use custom ID if provided
-        metadata: params.metadata,
-        name: params.name,
-        size: params.size,
-        url: params.url,
-      },
-      !isExist, // insertToGlobalFiles
-      trx,
-    );
+    const id = await this.writeFileRecord(params);
 
     return {
       fileId: id,
       url: await this.getFileAccessUrl({ id, url: params.url }),
     };
+  }
+
+  /** Probe storage before borrowing a connection; keep all record queries on that transaction. */
+  private async writeFileRecord(
+    params: FileRecordParams,
+    beforeRecord?: (trx: Transaction) => Promise<void>,
+  ): Promise<string> {
+    const observed = await this.fileModel.checkHash(params.fileHash);
+    const missingHashUrl =
+      observed.isExist &&
+      observed.url &&
+      observed.url !== params.url &&
+      !(await this.isStoredFileAvailable(observed.url))
+        ? observed.url
+        : undefined;
+
+    const { id } = await this.db.transaction(async (trx) => {
+      await beforeRecord?.(trx);
+
+      // The probe describes only the URL it observed. Re-read on the record transaction so a
+      // replaced pointer is preserved and a deleted global row is reinserted before the file row.
+      const current = await this.fileModel.checkHash(params.fileHash, trx);
+      if (missingHashUrl && current.isExist && current.url === missingHashUrl) {
+        await this.fileModel.updateGlobalFile(
+          params.fileHash,
+          { metadata: params.metadata, url: params.url },
+          trx,
+        );
+      }
+
+      return this.fileModel.create(
+        {
+          fileHash: params.fileHash,
+          fileType: params.fileType,
+          id: params.id,
+          metadata: params.metadata,
+          name: params.name,
+          size: params.size,
+          source: params.source,
+          url: params.url,
+          visibility: params.visibility,
+        },
+        !current.isExist,
+        trx,
+      );
+    });
+
+    return id;
   }
 
   /**
@@ -253,7 +315,7 @@ export class FileService {
    * @param fileId - File ID to delete from user's files table
    */
   public async deleteUserFileRecord(fileId: string): Promise<void> {
-    await this.fileModel.delete(fileId, false); // false = don't remove globalFiles
+    await this.fileModel.delete(fileId, { removeGlobalFile: false });
   }
 
   /**
@@ -401,6 +463,7 @@ export class FileService {
      * is removed again when it rejects.
      */
     beforeRecord?: (trx: Transaction) => Promise<void>,
+    recordOptions?: Pick<FileItem, 'source' | 'visibility'>,
   ): Promise<{ fileId: string; key: string; url: string }> {
     // Use uploadBuffer with explicit contentType so S3 Content-Type matches
     // the actual bytes (e.g. PNG buffer won't get image/jpeg from .jpg pathname)
@@ -418,32 +481,28 @@ export class FileService {
     const filename = parts.pop() || name;
     const dirname = parts.join('/');
 
-    const { fileId: createdId, url } = await this.db
-      .transaction(async (trx) => {
-        await beforeRecord?.(trx);
-
-        return this.createFileRecord(
-          {
-            fileHash: hash,
-            fileType: mimeType,
-            id: fileId,
-            metadata: {
-              date: new Date().toISOString().slice(0, 10),
-              dirname,
-              filename,
-              path: pathname,
-            },
-            name,
-            size,
-            url: key,
-          },
-          trx,
-        );
-      })
-      .catch(async (error) => {
-        await this.deleteFile(key).catch(() => {});
-        throw error;
-      });
+    const createdId = await this.writeFileRecord(
+      {
+        fileHash: hash,
+        fileType: mimeType,
+        id: fileId,
+        metadata: {
+          date: new Date().toISOString().slice(0, 10),
+          dirname,
+          filename,
+          path: pathname,
+        },
+        name,
+        size,
+        url: key,
+        ...recordOptions,
+      },
+      beforeRecord,
+    ).catch(async (error) => {
+      await this.deleteFile(key).catch(() => {});
+      throw error;
+    });
+    const url = await this.getFileAccessUrl({ id: createdId, url: key });
 
     return { fileId: createdId, key, url };
   }
@@ -504,13 +563,28 @@ export class FileService {
     return { fileId: createdId, key, url };
   }
 
+  /**
+   * Downloads a stored file to a temp path. `maxBytes` (optional) refuses a file larger than the
+   * limit before any bytes are read, by the stored size, and again by the bytes actually received.
+   * Callers that do not pass it (skill ZIP import) keep their own limits.
+   */
   async downloadFileToLocal(
     fileId: string,
-  ): Promise<{ cleanup: () => void; file: FileItem; filePath: string }> {
-    const file = await this.fileModel.findById(fileId);
+    accessScope: FileAccessScope = ordinaryFileAccessScope,
+    options: { maxBytes?: number } = {},
+  ): Promise<{ cleanup: () => Promise<void>; file: FileItem; filePath: string }> {
+    const file = await this.fileModel.findById(fileId, { accessScope });
     if (!file) {
       throw new TRPCError({ code: 'BAD_REQUEST', message: 'File not found' });
     }
+
+    const { maxBytes } = options;
+    const tooLarge = () =>
+      new TRPCError({
+        code: 'PAYLOAD_TOO_LARGE',
+        message: `Files larger than ${maxBytes} bytes cannot be parsed in memory`,
+      });
+    if (maxBytes !== undefined && file.size > maxBytes) throw tooLarge();
 
     let content: Uint8Array | undefined;
     try {
@@ -519,12 +593,16 @@ export class FileService {
       console.error(e);
       // if file not found, delete it from db
       if ((e as any).Code === 'NoSuchKey') {
-        await this.fileModel.delete(fileId, serverDBEnv.REMOVE_GLOBAL_FILE);
+        await this.fileModel.delete(fileId, {
+          accessScope,
+          removeGlobalFile: serverDBEnv.REMOVE_GLOBAL_FILE,
+        });
         throw new TRPCError({ code: 'BAD_REQUEST', message: 'File not found' });
       }
     }
 
     if (!content) throw new TRPCError({ code: 'BAD_REQUEST', message: 'File content is empty' });
+    if (maxBytes !== undefined && content.byteLength > maxBytes) throw tooLarge();
 
     const dir = nanoid();
     const tempManager = new TempFileManager(dir);

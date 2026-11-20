@@ -1,9 +1,15 @@
+import type { AgentRunLlmExecutor } from '@lobechat/agent-runtime';
 import type { BotPlatformContext } from '@lobechat/context-engine';
 import type {
+  AgentSenderMetadata,
   BotSenderMetadata,
   ChatTopicBotContext,
+  ChatTopicWebhookContext,
   ExecAgentParams,
+  ExternalOriginMetadata,
   LobeAgentChatConfig,
+  LobeAgentConfig,
+  MessageMetadata,
   RuntimeMentionedAgent,
   UserInterventionConfig,
   WorkingDirConfig,
@@ -12,10 +18,12 @@ import type {
 
 import type { EvalContext } from '@/server/modules/Mecha/ContextEngineering/types';
 import type { AgentConfigWithId } from '@/server/services/agent';
+import type { ClientRunSnapshot } from '@/server/services/agentRuntime/foregroundOperation';
 import type { AgentHook } from '@/server/services/agentRuntime/hooks/types';
 import type { EvalRuntimeContext } from '@/server/services/agentRuntime/types';
 
 import type { DeviceAccessReason } from './deviceAccessPolicy';
+import type { RunFacts } from './runFacts';
 import type { AgentShareGate } from './shareGate';
 
 /**
@@ -34,8 +42,21 @@ export interface ExecRunContext {
   appContext?: InternalExecAgentParams['appContext'];
   /** Persisted assistant placeholder row id (spinner anchor / error sink). */
   assistantMessageId: string;
+  /**
+   * Channel facts of a bot-originated run. Ambient like the agent config: the
+   * operation keeps them on `principal.actor.bot` / `world.channel`, so a stage
+   * that re-runs later reads them back from there rather than from the turn's
+   * request.
+   */
+  /** Library skills the agent set to `auto`; mirrored on `world.autoSkillIds`. */
+  autoSkillIds: string[];
+  botContext?: InternalExecAgentParams['botContext'];
+  botPlatformContext?: InternalExecAgentParams['botPlatformContext'];
   canUseDevice: boolean;
   deviceAccessReason: DeviceAccessReason;
+  /** Tri-state disabled plugin identifiers; mirrored on `world.disabledPluginIds`. */
+  disabledPluginIds: string[];
+  discordContext?: InternalExecAgentParams['discordContext'];
   /** Effective model for this run (topic-pinned model already applied). */
   model: string;
   parentMessageId?: string;
@@ -46,17 +67,31 @@ export interface ExecRunContext {
   /** The actual executing agent row id resolved from id/slug. */
   resolvedAgentId: string;
   /**
+   * Turn-invariant facts (device system info, the user's row), read once and
+   * shared by every stage of the send window.
+   */
+  runFacts: RunFacts;
+  /**
    * Shared-agent visitor gate for this run, mirrored from
    * {@link InternalExecAgentParams.shareGate} so every extracted pipeline stage
    * can enforce it without threading a separate argument. Undefined for every
    * ordinary (non-share) run.
    */
   shareGate?: AgentShareGate;
+  /** The group a reused Group Agent Builder topic was opened on — see `TurnSetupResult`. */
+  topicEditingGroupId?: string;
   /** Topic id — guaranteed to exist by the time pipeline stages run. */
   topicId: string;
   trigger?: string;
   /** User turn row id; undefined when the run starts from history (resume). */
   userMessageId?: string;
+  /**
+   * Metadata the user turn row was persisted with (attached content, steer,
+   * trigger, …); undefined when no row was created. Stages read attached content
+   * from here rather than from request fields, so a field persisted on the row
+   * is also the field the run sees.
+   */
+  userMessageMetadata?: MessageMetadata;
 }
 
 /**
@@ -64,8 +99,29 @@ export interface ExecRunContext {
  * This extends the public ExecAgentParams with server-side only options
  */
 export interface InternalExecAgentParams extends ExecAgentParams {
+  /**
+   * The calling client renders `file` Works in pushed snapshots, derived from
+   * the `streamFeatures` it declared on `aiAgent.execAgent`. See
+   * `OperationCreationParams.acceptsFileWorks`.
+   */
+  acceptsFileWorks?: boolean;
+  /**
+   * The calling client handles `member_runtime_end`, derived from the
+   * `streamFeatures` it declared on `aiAgent.execAgent`. See
+   * `OperationCreationParams.acceptsMemberRuntimeEnd`.
+   */
+  acceptsMemberRuntimeEnd?: boolean;
   /** Additional plugin IDs to inject (e.g., task tool during task execution) */
   additionalPluginIds?: string[];
+  /** Trusted settings frozen by a durable dispatcher, never accepted from a client. */
+  agentConfigSnapshot?: LobeAgentConfig;
+  /**
+   * The sending agent of an agent → agent turn, already resolved from its
+   * `sourceOperationId` by the server. Set by a queued follow-up, whose sender
+   * was resolved when it was queued: by the time it starts, the sending run may
+   * have settled and could no longer vouch for it. Never client-passable.
+   */
+  agentSender?: AgentSenderMetadata;
   /**
    * Server-authored generic intervention claim id. When present, the message
    * claim stores this exact id so a retry after dispatch-but-before-publish can
@@ -93,6 +149,11 @@ export interface InternalExecAgentParams extends ExecAgentParams {
    * set by the callSubAgent thread-run path, never client-passable.
    */
   chatConfigOverride?: Partial<LobeAgentChatConfig> | null;
+  /**
+   * The composer's view of this conversation's runs at send time. Diagnostic
+   * only: persisted when this start supersedes a live run, never used to decide.
+   */
+  clientRunSnapshot?: ClientRunSnapshot;
   /**
    * Thread `execAgent` materialised from `appContext.newThread` for THIS turn.
    * Internal-only: set by the wrapper after it creates the row, never
@@ -128,6 +189,12 @@ export interface InternalExecAgentParams extends ExecAgentParams {
    * as well as activator-discoverable manifests.
    */
   exclusivePluginIds?: string[];
+  /**
+   * Provider event that produced this server-injected turn (a GitHub CI
+   * failure waking the agent, …), persisted on the user message as
+   * `metadata.externalOrigin` so the bubble carries its source.
+   */
+  externalOrigin?: ExternalOriginMetadata;
   /** External files to upload to S3 and attach to the user message */
   files?: Array<{
     /** Pre-downloaded buffer (from adapter/platform layer) */
@@ -142,6 +209,8 @@ export interface InternalExecAgentParams extends ExecAgentParams {
   functionTools?: Array<{ description?: string; name: string; parameters?: Record<string, any> }>;
   /** External lifecycle hooks (auto-adapt to local/production mode) */
   hooks?: AgentHook[];
+  /** Initial LLM-call count offset for resumed operations (accumulated from previous runs) */
+  initialLlmCalls?: number;
   /** Initial step count offset for resumed operations (accumulated from previous runs) */
   initialStepCount?: number;
   /**
@@ -152,6 +221,18 @@ export interface InternalExecAgentParams extends ExecAgentParams {
    * and a refusal here destroys the message before it is ever persisted.
    */
   interactiveStart?: boolean;
+  /**
+   * The client's relay executor. Server callers may also set the channel it
+   * relays on (`channelOperationId`), which a client never can.
+   */
+  llmExecutor?: AgentRunLlmExecutor;
+  /**
+   * Explicit server-only opt-in for an unattended topic run to surface in Inbox.
+   * Set running atomically with its operation marker before dispatch; existing
+   * terminal settlement then projects done to unread and errors to active.
+   * Never inferred from trigger or accepted from client/API parameters.
+   */
+  markTopicRunning?: boolean;
   /** Maximum steps for the agent operation */
   maxSteps?: number;
   /**
@@ -162,10 +243,28 @@ export interface InternalExecAgentParams extends ExecAgentParams {
    * instead of answering itself. Mirrors the client runtime's mention wiring.
    */
   mentionedAgents?: RuntimeMentionedAgent[];
+  /** Prepare dependent records after the operation is persisted, before any execution dispatch. */
+  onOperationCreated?: (operationId: string) => Promise<void>;
   /** Parent message ID to continue from. Only takes effect when resume is true */
   parentMessageId?: string;
+  /**
+   * A server-started turn that takes over where a finished run left off (the
+   * server-side drain of queued follow-ups). Non-interactive thread starts
+   * must hold the thread-start fence and find no other live run — see
+   * `startOnThread`. Unlike `steer`, it never marks the user message.
+   */
+  queuedSuccessor?: boolean;
   queueRetries?: number;
   queueRetryDelay?: string;
+  /**
+   * The run must take place on the requested `deviceId`: refuse it, before
+   * anything is written, when the agent's effective execution target would drop
+   * that device (a workspace agent fixed to another target). Without it the
+   * device is a preference the target policy may override.
+   */
+  requireDevice?: boolean;
+  /** An idle operation reserved by the dispatcher for this exact Agent, topic and requester. */
+  reservedOperationId?: string;
   /** Whether to continue execution from an existing persisted message */
   resume?: boolean;
   /**
@@ -218,6 +317,13 @@ export interface InternalExecAgentParams extends ExecAgentParams {
     toolCallId: string;
   };
   /**
+   * Skill identifiers the user selected for this message. Persisted on the
+   * user message (`metadata.selectedSkillIds`) and, together with the ones
+   * earlier turns of the topic selected, injected with their bodies like a
+   * pinned skill. Never widens what the skill pool already allows.
+   */
+  selectedSkillIds?: string[];
+  /**
    * Tool identifiers the user @-mentioned in this message. Merged into the
    * agent's plugin set for this run (alongside `additionalPluginIds`) so a
    * mentioned tool that isn't pinned to the agent — e.g. a custom MCP connector
@@ -233,6 +339,19 @@ export interface InternalExecAgentParams extends ExecAgentParams {
   shareGate?: AgentShareGate;
   /** Abort startup before the agent runtime operation is created */
   signal?: AbortSignal;
+  /**
+   * With `agentConfigSnapshot`, still layer the caller's own device override on top, as an
+   * ordinary conversation would. Set by a Channel run whose member has no device picked in the
+   * Channel; the snapshot keeps deciding everything else. Server-only, never client-passable.
+   */
+  snapshotFollowsCallerDevice?: boolean;
+  /**
+   * The send directly steered the turn it replaces: an interrupting "send
+   * now", not a follow-up that waited in queue and started as the next turn.
+   * The user message is persisted with `metadata.steer` so it renders as a
+   * continuation of the steered turn.
+   */
+  steer?: boolean;
   /**
    * Whether the LLM call should use streaming.
    * Defaults to true. Set to false for non-streaming scenarios (e.g., bot integrations).
@@ -276,6 +395,12 @@ export interface InternalExecAgentParams extends ExecAgentParams {
    * Use { approvalMode: 'headless' } for async tasks that should never wait for human approval
    */
   userInterventionConfig?: UserInterventionConfig;
+  /**
+   * Server-only: the generic webhook thread a run starts for. Written to a
+   * Topic the run creates as `metadata.webhook`, which is how later deliveries
+   * of the same thread find that Topic. Ignored when the run continues one.
+   */
+  webhookThread?: ChatTopicWebhookContext;
 }
 
 /**
@@ -289,6 +414,16 @@ export interface InternalExecAgentParams extends ExecAgentParams {
  * project path placeholder (and the tool cwd/scope downstream) without re-loading
  * the device + topic the scan already read.
  */
+export interface BindTopicWorkingDirectoryParams {
+  config?: WorkingDirConfig;
+  /** The topic's existing `metadata.boundDeviceId`, if any. */
+  currentDeviceId?: string;
+  currentWorkingDirectory?: string;
+  /** The device {@link config} was resolved for. */
+  deviceId?: string;
+  topicId: string;
+}
+
 export interface ResolvedWorkspaceInit {
   boundCwd?: string;
   /**
@@ -298,6 +433,8 @@ export interface ResolvedWorkspaceInit {
    * a linked worktree must still file under its repo.
    */
   boundCwdConfig?: WorkingDirConfig;
+  /** The device the topic's cwd is pinned on (`topic.metadata.boundDeviceId`). */
+  topicDeviceId?: string;
   /**
    * The cwd the topic was ALREADY pinned to, so a caller can tell a first-time
    * binding from a no-op rewrite without re-reading the topic row.

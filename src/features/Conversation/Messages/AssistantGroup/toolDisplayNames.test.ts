@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { AssistantContentBlock } from '@/types/index';
 
 import {
+  formatReasoningDuration,
   getToolDisplayName,
   getWorkflowStreamingHeadlineState,
   getWorkflowSummaryText,
@@ -13,6 +14,63 @@ const blk = (p: Partial<AssistantContentBlock> & { id: string }): AssistantConte
   ({ content: '', ...p }) as AssistantContentBlock;
 
 describe('tool display names', () => {
+  it('reads a running lh goal step as the goal step, not a raw command', () => {
+    const goalCall = (
+      command: string,
+      result?: { content: string; error?: unknown; state?: unknown },
+    ) =>
+      blk({
+        id: 'goal',
+        tools: [
+          {
+            apiName: 'Bash',
+            arguments: JSON.stringify({ command, description: 'Create LobeHub goal' }),
+            id: 'toolu_goal',
+            identifier: 'claude-code',
+            result,
+          } as any,
+        ],
+      });
+
+    // The plugin namespace is not loaded here, so labels resolve to their keys.
+    expect(
+      getWorkflowStreamingHeadlineState([
+        goalCall('lh goal create "Fog report" --conversation --json'),
+      ]),
+    ).toMatchObject({
+      fallbackTool: 'builtins.goalCommand.create.loading Fog report',
+      kind: 'tool',
+    });
+    expect(
+      getWorkflowStreamingHeadlineState([
+        goalCall('lh goal create "Fog report" --conversation --json', { content: '{}' }),
+      ]),
+    ).toMatchObject({ fallbackTool: 'builtins.goalCommand.create.completed Fog report' });
+    expect(
+      getWorkflowStreamingHeadlineState([
+        goalCall('lh goal create "Fog report" --conversation --json', {
+          content: 'Error: An operation-bound token is required',
+          error: { message: 'exit 1' },
+        }),
+      ]),
+    ).toMatchObject({ fallbackTool: 'builtins.goalCommand.create.failed Fog report' });
+    // A shell step can report failure only through its run state; the headline
+    // used to read "completed" then.
+    expect(
+      getWorkflowStreamingHeadlineState([
+        goalCall('lh goal create "Fog report" --conversation --json', {
+          content: 'error: unknown option',
+          state: { exitCode: 1, success: false },
+        }),
+      ]),
+    ).toMatchObject({ fallbackTool: 'builtins.goalCommand.create.failed Fog report' });
+    expect(
+      getWorkflowStreamingHeadlineState([
+        goalCall('lh goal plan goal_1 --token t --file plan.json --json'),
+      ]),
+    ).toMatchObject({ fallbackTool: 'builtins.goalCommand.plan.loading' });
+  });
+
   it('uses friendly labels for Codex tool api names', () => {
     expect(getToolDisplayName('command_execution')).toBe('Ran a command');
     expect(getToolDisplayName('file_change')).toBe('Edited a file');
@@ -165,8 +223,30 @@ describe('reasoning headline extraction', () => {
     // the plugin i18n namespace is not registered in the test harness, so the
     // label falls back to the apiName; the shape under test is label + keyword.
     expect(state.kind).toBe('tool');
-    expect((state as any).fallbackTool).toMatch(/ monthly\.ts$/);
+    expect((state as any).fallbackTool).toMatch(/ npx tsx scripts\/gross-margin\/monthly\.ts$/);
     expect((state as any).fallbackTool).not.toContain('set -a');
+  });
+
+  it('renders a running undescribed shell command as what it does', () => {
+    const state = getWorkflowStreamingHeadlineState([
+      blk({
+        id: '0',
+        tools: [
+          {
+            apiName: 'Bash',
+            arguments: JSON.stringify({ command: 'cd /repo && rg -n "TODO" src' }),
+            id: 't1',
+            identifier: 'claude-code',
+          } as any,
+        ],
+      }),
+    ]);
+
+    // The plugin namespace is not loaded here, so the label resolves to its key.
+    expect(state).toMatchObject({
+      fallbackTool: 'builtins.shellCommand.search TODO in src',
+      kind: 'tool',
+    });
   });
 
   it('uses prose state when the trailing block is prose', () => {
@@ -237,5 +317,24 @@ describe('reasoning headline extraction', () => {
       kind: 'thinking',
       reasoningTitle: 'Search release notes',
     });
+  });
+});
+
+describe('formatReasoningDuration', () => {
+  it('formats sub-minute durations in seconds', () => {
+    expect(formatReasoningDuration(49_000)).toBe('49s');
+  });
+
+  it('formats sub-hour durations in minutes and seconds', () => {
+    expect(formatReasoningDuration(217_000)).toBe('3m 37s');
+    expect(formatReasoningDuration(180_000)).toBe('3m');
+  });
+
+  it('rolls minutes up to hours past the hour mark', () => {
+    // The row used to read "251m 49s" for this turn.
+    expect(formatReasoningDuration(15_109_000)).toBe('4h 11m');
+    expect(formatReasoningDuration(3_600_000)).toBe('1h');
+    expect(formatReasoningDuration(3_660_000)).toBe('1h 1m');
+    expect(formatReasoningDuration(3_599_000)).toBe('59m 59s');
   });
 });

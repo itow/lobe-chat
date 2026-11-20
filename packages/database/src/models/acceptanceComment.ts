@@ -1,16 +1,22 @@
 import type {
+  AcceptanceAccessRequest,
+  AcceptanceAccessRequestStatus,
   AcceptanceCommentAttachmentRef,
   AcceptanceCommentKind,
+  AcceptanceCommentMetadata,
+  AcceptanceCommentSource,
+  AcceptanceCommentTime,
   AcceptanceReviewAnnotation,
   DocumentCommentJson,
 } from '@lobechat/types';
-import { and, count, desc, eq, isNull, ne } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gte, inArray, isNull, ne, sql } from 'drizzle-orm';
 
 import type { AcceptanceCommentRow } from '../schemas/acceptanceComment';
 import { acceptanceComments } from '../schemas/acceptanceComment';
 import type { LobeChatDatabase } from '../type';
 
 export const ACCEPTANCE_COMMENT_PARENT_NOT_FOUND = 'Parent comment not found in this acceptance';
+export const ACCEPTANCE_COMMENT_RATE_LIMITED = 'Too many comments in the window';
 
 /**
  * One person's emoji on one comment is one row, and the idempotency key is
@@ -30,6 +36,7 @@ export interface CreateAcceptanceCommentParams {
     checkItemId: string;
     evidenceId: string;
     rect: AcceptanceReviewAnnotation['rect'];
+    time?: AcceptanceCommentTime;
   };
   /** Files to hang on the remark, kept apart from the body. */
   attachments?: AcceptanceCommentAttachmentRef[];
@@ -42,7 +49,18 @@ export interface CreateAcceptanceCommentParams {
   /** The editor's JSON, when a person wrote the body in one. */
   editorData?: DocumentCommentJson;
   kind?: AcceptanceCommentKind;
+  /** Open, server-written per-remark facts. */
+  metadata?: AcceptanceCommentMetadata;
   parentCommentId?: string;
+  /**
+   * Ceiling for this author on this acceptance, enforced inside the write's own
+   * transaction. Counting outside it would be advisory only: a handful of
+   * parallel requests all read the same under-limit count before any of them
+   * commits, which is exactly how a flood arrives.
+   */
+  rateLimit?: { max: number; since: Date };
+  /** The product page the remark was made on (embedded acceptance toolbar). */
+  source?: AcceptanceCommentSource;
   workspaceId?: string | null;
 }
 
@@ -70,6 +88,40 @@ export class AcceptanceCommentModel {
     params: CreateAcceptanceCommentParams,
   ): Promise<CreateAcceptanceCommentResult> => {
     return this.db.transaction(async (tx) => {
+      const isAccessRequest = params.kind === 'access_request';
+      if (params.rateLimit || isAccessRequest)
+        // One author on one acceptance is the contended pair, and the lock is
+        // released when this transaction ends either way. Everybody else writes
+        // in parallel exactly as before.
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtext(${params.acceptanceId}), hashtext(${params.authorUserId}))`,
+        );
+
+      // One standing access request per person. Checked under the lock above,
+      // in the same transaction as the insert: checked before it, two tabs
+      // asking at once would each see none and both write a pending request —
+      // and a grant on the older one would not count, since only the newest
+      // request is ever read back as the grant.
+      if (isAccessRequest) {
+        const [standing] = await tx
+          .select()
+          .from(acceptanceComments)
+          .where(
+            and(
+              eq(acceptanceComments.acceptanceId, params.acceptanceId),
+              eq(acceptanceComments.authorUserId, params.authorUserId),
+              eq(acceptanceComments.kind, 'access_request'),
+              isNull(acceptanceComments.parentCommentId),
+              isNull(acceptanceComments.deletedAt),
+            ),
+          )
+          .orderBy(desc(acceptanceComments.createdAt), desc(acceptanceComments.id))
+          .limit(1);
+        const status = standing?.metadata?.accessRequest?.status;
+        if (standing && (status === 'pending' || status === 'granted'))
+          return { comment: standing, isDuplicate: true };
+      }
+
       let parentCommentId: string | undefined;
       if (params.parentCommentId) {
         const [parent] = await tx
@@ -111,6 +163,11 @@ export class AcceptanceCommentModel {
           evidenceId: anchor?.evidenceId ?? null,
           kind: isReply ? 'comment' : (params.kind ?? 'comment'),
           parentCommentId: parentCommentId ?? null,
+          metadata: anchor?.time
+            ? { ...params.metadata, evidenceAnchor: { time: anchor.time } }
+            : (params.metadata ?? null),
+          // A page belongs to the thread it opened, never to a reply or reaction.
+          source: parentCommentId ? null : (params.source ?? null),
           workspaceId: params.workspaceId ?? null,
         })
         .onConflictDoNothing({
@@ -122,7 +179,26 @@ export class AcceptanceCommentModel {
         })
         .returning();
 
-      if (inserted) return { comment: inserted, isDuplicate: false };
+      if (inserted) {
+        if (params.rateLimit) {
+          const [recent] = await tx
+            .select({ total: count() })
+            .from(acceptanceComments)
+            .where(
+              and(
+                eq(acceptanceComments.acceptanceId, params.acceptanceId),
+                eq(acceptanceComments.authorUserId, params.authorUserId),
+                ne(acceptanceComments.kind, 'reaction'),
+                gte(acceptanceComments.createdAt, params.rateLimit.since),
+              ),
+            );
+          // The row just written is part of this count, so the first one over
+          // the ceiling rolls itself back and nothing lands.
+          if ((recent?.total ?? 0) > params.rateLimit.max)
+            throw new Error(ACCEPTANCE_COMMENT_RATE_LIMITED);
+        }
+        return { comment: inserted, isDuplicate: false };
+      }
 
       const [existing] = await tx
         .select()
@@ -149,14 +225,15 @@ export class AcceptanceCommentModel {
   };
 
   /**
-   * Every row of one acceptance, oldest first. A discussion on one delivery is
+   * Recent rows of one acceptance, oldest first. A discussion on one delivery is
    * small by nature (a handful of people over a handful of rounds), so the page
    * reads it whole and groups threads client-side.
    *
    * The cap takes the NEWEST rows and hands them back in reading order. Taking
    * the oldest would mean that past the cap a successful post never appears —
    * the write succeeds, the reload drops it, and the author is told nothing.
-   * Losing the far end of a very long history is the better failure.
+   * Retain roots referenced by recent replies even outside that window: they
+   * carry the evidence anchor and resolution state needed to read each reply.
    */
   listByAcceptance = async (acceptanceId: string) => {
     const rows = await this.db
@@ -165,15 +242,54 @@ export class AcceptanceCommentModel {
       .where(eq(acceptanceComments.acceptanceId, acceptanceId))
       .orderBy(desc(acceptanceComments.createdAt), desc(acceptanceComments.id))
       .limit(MAX_COMMENTS_PER_ACCEPTANCE);
-    return rows.reverse();
+    const visibleIds = new Set(rows.map((row) => row.id));
+    const missingRootIds = [
+      ...new Set(
+        rows.flatMap((row) =>
+          row.kind !== 'reaction' && row.parentCommentId && !visibleIds.has(row.parentCommentId)
+            ? [row.parentCommentId]
+            : [],
+        ),
+      ),
+    ];
+    if (missingRootIds.length === 0) return rows.reverse();
+
+    const roots = await this.db
+      .select()
+      .from(acceptanceComments)
+      .where(
+        and(
+          eq(acceptanceComments.acceptanceId, acceptanceId),
+          inArray(acceptanceComments.id, missingRootIds),
+        ),
+      )
+      .orderBy(asc(acceptanceComments.createdAt), asc(acceptanceComments.id));
+    // Missing roots precede the capped window. Keep the DB's ordering (including
+    // timestamp precision and ID tie-breaks) rather than sorting hydrated Dates.
+    return [...roots, ...rows.reverse()];
   };
 
   /**
-   * Delete the author's own comment. A root that still has replies becomes a
-   * tombstone so the replies keep their context; a reply whose tombstoned root
-   * has no other replies takes the root with it.
+   * Remove one comment. A root that still has replies becomes a tombstone so
+   * the replies keep their context; a reply whose tombstoned root has no other
+   * replies takes the root with it.
+   *
+   * `by.authorUserId` scopes the removal to that author's own row — the normal
+   * case. `by.moderator` skips the author check for someone the caller has
+   * already established may moderate this acceptance: since the discussion is
+   * open to anyone holding a public link, its owner needs a way to take a
+   * remark down, and the author of an unwanted remark is exactly who will not
+   * remove it. The router decides who that is; the model only obeys.
    */
-  delete = async (id: string, authorUserId: string): Promise<'hard' | 'soft' | false> => {
+  delete = async (
+    id: string,
+    by: { authorUserId: string } | { moderator: true },
+  ): Promise<'hard' | 'soft' | false> => {
+    const authorUserId = 'authorUserId' in by ? by.authorUserId : undefined;
+    const ownRow = (rowId: string) =>
+      authorUserId
+        ? and(eq(acceptanceComments.id, rowId), eq(acceptanceComments.authorUserId, authorUserId))
+        : eq(acceptanceComments.id, rowId);
     return this.db.transaction(async (tx) => {
       const [target] = await tx
         .select({
@@ -182,9 +298,7 @@ export class AcceptanceCommentModel {
           parentCommentId: acceptanceComments.parentCommentId,
         })
         .from(acceptanceComments)
-        .where(
-          and(eq(acceptanceComments.id, id), eq(acceptanceComments.authorUserId, authorUserId)),
-        )
+        .where(ownRow(id))
         .limit(1);
       if (!target) return false;
 
@@ -216,9 +330,7 @@ export class AcceptanceCommentModel {
               parentCommentId: acceptanceComments.parentCommentId,
             })
             .from(acceptanceComments)
-            .where(
-              and(eq(acceptanceComments.id, id), eq(acceptanceComments.authorUserId, authorUserId)),
-            )
+            .where(ownRow(id))
             .limit(1)
             .for('update')
         : [{ ...target, deletedAt: root.deletedAt }];
@@ -298,6 +410,86 @@ export class AcceptanceCommentModel {
       )
       .returning({ id: acceptanceComments.id });
     return deleted.length > 0;
+  };
+
+  /**
+   * One person's standing access request on one acceptance: their newest
+   * surviving `access_request` row, whatever its answer. Withdrawing the request
+   * (deleting the row) is how a requester gives a grant back, and a moderator
+   * taking it down takes the grant with it.
+   */
+  findLatestAccessRequest = async (acceptanceId: string, authorUserId: string) => {
+    const [row] = await this.db
+      .select()
+      .from(acceptanceComments)
+      .where(
+        and(
+          eq(acceptanceComments.acceptanceId, acceptanceId),
+          eq(acceptanceComments.authorUserId, authorUserId),
+          eq(acceptanceComments.kind, 'access_request'),
+          isNull(acceptanceComments.parentCommentId),
+          isNull(acceptanceComments.deletedAt),
+        ),
+      )
+      .orderBy(desc(acceptanceComments.createdAt), desc(acceptanceComments.id))
+      .limit(1);
+    return row;
+  };
+
+  /** Whether a decider has granted this person `permission` on this acceptance. */
+  hasAccessGrant = async (
+    acceptanceId: string,
+    userId: string,
+    permission: AcceptanceAccessRequest['permission'],
+  ) => {
+    const request = (await this.findLatestAccessRequest(acceptanceId, userId))?.metadata
+      ?.accessRequest;
+    return request?.status === 'granted' && request.permission === permission;
+  };
+
+  /**
+   * Move an access request from `from` to `next`. Conditional on the status the
+   * caller read, so two deciders answering at once cannot both win — the second
+   * update matches nothing and returns undefined.
+   */
+  answerAccessRequest = async (
+    id: string,
+    from: AcceptanceAccessRequestStatus,
+    next: AcceptanceAccessRequest,
+  ) => {
+    const [row] = await this.db
+      .update(acceptanceComments)
+      .set({
+        metadata: sql`jsonb_set(coalesce(${acceptanceComments.metadata}, '{}'::jsonb), '{accessRequest}', ${JSON.stringify(next)}::jsonb)`,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(acceptanceComments.id, id),
+          eq(acceptanceComments.kind, 'access_request'),
+          isNull(acceptanceComments.deletedAt),
+          sql`${acceptanceComments.metadata} -> 'accessRequest' ->> 'status' = ${from}`,
+        ),
+      )
+      .returning();
+    return row;
+  };
+
+  resolveRoots = async (acceptanceId: string, rootIds: string[], userId: string) => {
+    if (!rootIds.length) return [];
+    return this.db
+      .update(acceptanceComments)
+      .set({ resolvedAt: new Date(), resolvedByUserId: userId, updatedAt: new Date() })
+      .where(
+        and(
+          eq(acceptanceComments.acceptanceId, acceptanceId),
+          inArray(acceptanceComments.id, rootIds),
+          isNull(acceptanceComments.parentCommentId),
+          isNull(acceptanceComments.resolvedAt),
+          isNull(acceptanceComments.deletedAt),
+        ),
+      )
+      .returning();
   };
 
   /** Mark a thread root handled (or reopen it). Replies are not resolvable. */

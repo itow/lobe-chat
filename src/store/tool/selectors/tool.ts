@@ -1,17 +1,24 @@
 import { getBuiltinRenderDisplayControl } from '@lobechat/builtin-tools/displayControls';
-import { getComposioAppByIdentifier, getLobehubSkillProviderById } from '@lobechat/const';
+import {
+  getComposioAppByIdentifier,
+  getLobehubSkillProviderById,
+  isDesktop,
+} from '@lobechat/const';
 import { type RenderDisplayControl, type ToolManifest } from '@lobechat/types';
 
 import {
   isInstalledPluginAvailableInCurrentEnv,
   isToolAvailableInCurrentEnv,
 } from '@/helpers/toolAvailability';
+import { buildClientConnectorManifests } from '@/helpers/toolEngineering/buildClientConnectorManifests';
 import { type MetaData } from '@/types/meta';
 import { type LobeToolMeta } from '@/types/tool/tool';
 
 import { type ToolStoreState } from '../initialState';
+import { agentSkillsSelectors } from '../slices/agentSkills/selectors';
 import { builtinToolSelectors } from '../slices/builtin/selectors';
 import { ComposioServerStatus } from '../slices/composioStore';
+import { connectorSelectors } from '../slices/connector/selectors';
 import { lobehubSkillStoreSelectors } from '../slices/lobehubSkillStore';
 import { LobehubSkillStatus } from '../slices/lobehubSkillStore/types';
 import { pluginSelectors } from '../slices/plugin/selectors';
@@ -53,13 +60,25 @@ const getMetaById =
     };
   };
 
+/**
+ * The MCP connectors chat can run, as the tools engine offers them: custom
+ * ones and finished marketplace installs (every MCP install lands here now).
+ */
+const executableConnectorManifests = (s: ToolStoreState): ToolManifest[] =>
+  buildClientConnectorManifests(connectorSelectors.executableMcpConnectors(s));
+
+/**
+ * A connector-only identifier is read from its connector; one that still has
+ * a plugin row is read from the plugin, as before.
+ */
 const getManifestById =
   (id: string) =>
   (s: ToolStoreState): ToolManifest | undefined =>
     pluginSelectors
       .installedPluginManifestList(s)
       .concat(s.builtinTools.map((b) => b.manifest as ToolManifest))
-      .find((i) => i.identifier === id);
+      .find((i) => i.identifier === id) ??
+    executableConnectorManifests(s).find((i) => i.identifier === id);
 
 // Get plugin manifest loading status
 const getManifestLoadingStatus = (id: string) => (s: ToolStoreState) => {
@@ -128,11 +147,15 @@ export interface AvailableToolForDiscovery {
  * 2. User-installed plugins (from s.installedPlugins) — exclude Composio/LobeHub Skill/agent skill overlap
  * 3. Composio MCP servers (connected) — description from COMPOSIO_APP_TYPES
  * 4. LobeHub Skill servers (connected) — description from LOBEHUB_SKILL_PROVIDERS
+ * 5. MCP connectors chat can run (custom, finished marketplace installs) that no
+ *    entry above already lists — stdio ones only on desktop
  */
 const availableToolsForDiscovery = (s: ToolStoreState): AvailableToolForDiscovery[] => {
   // Build exclusion sets for deduplication
   const builtinSkillIds = new Set((s.builtinSkills || []).map((skill) => skill.identifier));
-  const agentSkillIds = new Set((s.agentSkills || []).map((skill) => skill.identifier));
+  const agentSkillIds = new Set(
+    agentSkillsSelectors.getAgentSkills(s).map((skill) => skill.identifier),
+  );
   const composioIds = new Set((s.composioServers || []).map((server) => server.identifier));
   const lobehubSkillIds = new Set((s.lobehubSkillServers || []).map((server) => server.identifier));
 
@@ -147,9 +170,11 @@ const availableToolsForDiscovery = (s: ToolStoreState): AvailableToolForDiscover
       name: tool.title || tool.identifier,
     }));
 
-  // 2. User-installed plugins — directly from s.installedPlugins
+  // 2. User-installed plugins — only full records: a plugin painted from the
+  //    cached display projection has no connection yet, so it cannot be activated.
   //    Exclude Composio, LobeHub Skill, and agent skill entries (they are handled in dedicated sources)
-  const pluginItems = s.installedPlugins
+  const pluginItems = pluginSelectors
+    .confirmedInstalledPlugins(s)
     .filter((p) => !composioIds.has(p.identifier))
     .filter((p) => !lobehubSkillIds.has(p.identifier))
     .filter((p) => !agentSkillIds.has(p.identifier))
@@ -198,12 +223,39 @@ const availableToolsForDiscovery = (s: ToolStoreState): AvailableToolForDiscover
       };
     });
 
-  return [...builtinItems, ...pluginItems, ...composioItems, ...lobehubSkillItems];
+  // 5. MCP connectors no plugin row serves (every MCP install now), as the
+  //    tools engine offers them. Stdio servers run only on a desktop.
+  const listed = new Set([...builtinItems, ...pluginItems].map((item) => item.identifier));
+  const runnableHere = new Set(
+    connectorSelectors
+      .executableMcpConnectors(s)
+      .filter((connector) => isDesktop || connector.mcpConnectionType !== 'stdio')
+      .map((connector) => connector.identifier),
+  );
+  const connectorItems = executableConnectorManifests(s)
+    .filter((manifest) => runnableHere.has(manifest.identifier))
+    .filter((manifest) => !listed.has(manifest.identifier))
+    .filter((manifest) => !composioIds.has(manifest.identifier))
+    .filter((manifest) => !lobehubSkillIds.has(manifest.identifier))
+    .map((manifest) => ({
+      description: manifest.meta?.description || '',
+      identifier: manifest.identifier,
+      name: manifest.meta?.title || manifest.identifier,
+    }));
+
+  return [
+    ...builtinItems,
+    ...pluginItems,
+    ...composioItems,
+    ...lobehubSkillItems,
+    ...connectorItems,
+  ];
 };
 
 export const toolSelectors = {
   availableToolsForDiscovery,
   discoverableMetaList,
+  executableConnectorManifests,
   getManifestById,
   getManifestLoadingStatus,
   getPluginInstallError,

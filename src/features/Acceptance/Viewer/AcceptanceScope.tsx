@@ -1,12 +1,14 @@
 'use client';
 
-import { Center, Empty } from '@lobehub/ui';
-import { Button } from '@lobehub/ui/base-ui';
+import { Button, Center, Icon, Spin } from '@lobehub/ui';
+import { Info, RefreshCw } from 'lucide-react';
 import { createContext, type ReactNode, use } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import NeuralNetworkLoading from '@/components/NeuralNetworkLoading';
+import { isTrpcErrorCode } from '@/utils/trpcError';
 
+import AcceptanceNotFound from './AcceptanceNotFound';
+import QuietState from './QuietState';
 import { useAcceptanceBundle } from './useAcceptanceBundle';
 
 type AcceptanceScopeValue = {
@@ -45,13 +47,27 @@ export const AcceptanceBundleGate = ({
   height?: string | number;
 }) => {
   const { t } = useTranslation('verify');
-  const { acceptanceId } = useAcceptanceScope();
-  const { data, isLoading, mutate } = useAcceptanceBundle(acceptanceId);
+  const { acceptanceId, embedded } = useAcceptanceScope();
+  const { data, error, isLoading, mutate } = useAcceptanceBundle(acceptanceId);
 
   if (isLoading && !data) {
     return (
       <Center height={height}>
-        <NeuralNetworkLoading size={48} />
+        <Spin size="large" />
+      </Center>
+    );
+  }
+
+  /**
+   * A deleted acceptance and one that was never shared with this reader answer
+   * the same way — NOT_FOUND, so a link cannot be used to probe for what
+   * exists. Either way it will not appear by trying again, so it says so
+   * instead of blaming the network and offering a retry that cannot work.
+   */
+  if (!data && isTrpcErrorCode(error, 'NOT_FOUND')) {
+    return (
+      <Center height={height}>
+        <AcceptanceNotFound embedded={embedded} />
       </Center>
     );
   }
@@ -59,9 +75,17 @@ export const AcceptanceBundleGate = ({
   if (!data) {
     return (
       <Center height={height}>
-        <Empty description={t('acceptance.error.description')} title={t('acceptance.error.title')}>
-          <Button onClick={() => void mutate()}>{t('report.actions.retry')}</Button>
-        </Empty>
+        <QuietState
+          description={t('acceptance.error.description')}
+          icon={Info}
+          title={t('acceptance.error.title')}
+          tone={'warning'}
+          action={
+            <Button icon={<Icon icon={RefreshCw} />} onClick={() => void mutate()}>
+              {t('report.actions.retry')}
+            </Button>
+          }
+        />
       </Center>
     );
   }

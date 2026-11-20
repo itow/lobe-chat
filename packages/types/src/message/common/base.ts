@@ -43,6 +43,29 @@ export interface ChatErrorBudgetContext {
 }
 
 /**
+ * Safe context for a run that failed before its agent started (fail-fast
+ * dispatch), for completion hooks and IM replies. Only allowlisted fields:
+ * the free-form dispatch detail stays on the message row.
+ */
+export interface ChatErrorDispatchContext {
+  agentType: string;
+  /** The sender may not use the agent's device, so the run fell back to the cloud sandbox. */
+  deviceAccessDenied?: boolean;
+  /** Environment-variable name of a credential the sandbox reported missing — never its value. */
+  missingCredential?: string;
+  stage: 'sandbox_spawn';
+}
+
+/** Safe external-agent error context for completion hooks and IM replies. */
+export interface ChatErrorHeterogeneousContext {
+  agentType: string;
+  kind: string;
+  rateLimitType?: string;
+  /** Quota reset as Unix epoch seconds, only from a rejected quota window. */
+  resetsAt?: number;
+}
+
+/**
  * Chat message error object
  */
 export interface ChatMessageError {
@@ -53,6 +76,8 @@ export interface ChatMessageError {
   category?: string;
   /** Whether this counts toward operational failure metrics. */
   countAsFailure?: boolean;
+  /** Namespaced support reference, e.g. H2001 for an external agent. */
+  errorRef?: string;
   /** HTTP status the runtime returned (or would return) for this error. */
   httpStatus?: number;
   /**
@@ -74,6 +99,7 @@ export interface ChatMessageError {
 export const ChatMessageErrorSchema = z.object({
   attribution: z.enum(['user', 'provider', 'harness', 'system']).optional(),
   body: z.any().optional(),
+  errorRef: z.string().optional(),
   category: z.string().optional(),
   countAsFailure: z.boolean().optional(),
   httpStatus: z.number().optional(),

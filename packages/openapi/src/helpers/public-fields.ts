@@ -1,3 +1,5 @@
+import { parsePluginEntry } from '@lobechat/types';
+
 import type {
   AgentEvalDatasetItem,
   AgentEvalRunItem,
@@ -6,6 +8,8 @@ import type {
   AgentItem,
   AiModelSelectItem,
   AiProviderSelectItem,
+  ChatGroupAgentItem,
+  ChatGroupItem,
   FileItem,
   KnowledgeBaseItem,
   MessageItem,
@@ -131,6 +135,24 @@ export const PUBLIC_AGENT_GROUP_FIELDS = [
   'sort',
   'updatedAt',
 ] as const satisfies readonly (keyof SessionGroupItem)[];
+
+export const PUBLIC_CHAT_GROUP_FIELDS = [
+  'avatar',
+  'backgroundColor',
+  'createdAt',
+  'description',
+  'id',
+  'pinned',
+  'title',
+  'updatedAt',
+] as const satisfies readonly (keyof ChatGroupItem)[];
+
+export const PUBLIC_CHAT_GROUP_MEMBER_FIELDS = [
+  'agentId',
+  'enabled',
+  'order',
+  'role',
+] as const satisfies readonly (keyof ChatGroupAgentItem)[];
 
 export const PUBLIC_SESSION_FIELDS = [
   'avatar',
@@ -276,7 +298,10 @@ export const PUBLIC_EVAL_RUN_TOPIC_FIELDS = [
   'topicId',
 ] as const satisfies readonly (keyof AgentEvalRunTopicItem)[];
 
-export type PublicAgent = Pick<AgentItem, (typeof PUBLIC_AGENT_FIELDS)[number]>;
+export type PublicAgent = Pick<AgentItem, (typeof PUBLIC_AGENT_FIELDS)[number]> & {
+  personal: boolean;
+  plugins: ReturnType<typeof parsePluginEntry>[];
+};
 export type PublicUser = Pick<UserItem, (typeof PUBLIC_USER_FIELDS)[number]>;
 export type PublicProvider = Pick<AiProviderSelectItem, (typeof PUBLIC_PROVIDER_FIELDS)[number]>;
 export type PublicModel = Pick<AiModelSelectItem, (typeof PUBLIC_MODEL_FIELDS)[number]>;
@@ -286,6 +311,14 @@ export type PublicKnowledgeBase = Pick<
   (typeof PUBLIC_KNOWLEDGE_BASE_FIELDS)[number]
 >;
 export type PublicAgentGroup = Pick<SessionGroupItem, (typeof PUBLIC_AGENT_GROUP_FIELDS)[number]>;
+export type PublicChatGroupMember = Pick<
+  ChatGroupAgentItem,
+  (typeof PUBLIC_CHAT_GROUP_MEMBER_FIELDS)[number]
+>;
+export type PublicChatGroup = Pick<ChatGroupItem, (typeof PUBLIC_CHAT_GROUP_FIELDS)[number]> & {
+  members: PublicChatGroupMember[];
+  personal: boolean;
+};
 export type PublicSession = Pick<SessionItem, (typeof PUBLIC_SESSION_FIELDS)[number]>;
 export type PublicTopic = Pick<TopicItem, (typeof PUBLIC_TOPIC_FIELDS)[number]>;
 export type PublicMessage = Pick<MessageItem, (typeof PUBLIC_MESSAGE_FIELDS)[number]>;
@@ -305,8 +338,11 @@ export type PublicEvalRunTopic = Pick<
 export type PublicRole = Pick<RoleItem, (typeof PUBLIC_ROLE_FIELDS)[number]>;
 export type PublicPermission = Pick<PermissionItem, (typeof PUBLIC_PERMISSION_FIELDS)[number]>;
 
-export const projectPublicAgent = (value: AgentItem): PublicAgent =>
-  pickPublicFields(value, PUBLIC_AGENT_FIELDS);
+export const projectPublicAgent = (value: AgentItem): PublicAgent => ({
+  ...pickPublicFields(value, PUBLIC_AGENT_FIELDS),
+  personal: value.metadata?.personal === true,
+  plugins: (value.plugins ?? []).map(parsePluginEntry),
+});
 
 export const projectPublicUser = (value: UserItem): PublicUser =>
   pickPublicFields(value, PUBLIC_USER_FIELDS);
@@ -326,13 +362,22 @@ export const projectPublicKnowledgeBase = (value: KnowledgeBaseItem): PublicKnow
 export const projectPublicAgentGroup = (value: SessionGroupItem): PublicAgentGroup =>
   pickPublicFields(value, PUBLIC_AGENT_GROUP_FIELDS);
 
+export const projectPublicChatGroup = (
+  value: ChatGroupItem,
+  members: ChatGroupAgentItem[],
+): PublicChatGroup => ({
+  ...pickPublicFields(value, PUBLIC_CHAT_GROUP_FIELDS),
+  members: members.map((member) => pickPublicFields(member, PUBLIC_CHAT_GROUP_MEMBER_FIELDS)),
+  personal: value.config?.personal === true,
+});
+
 export const projectPublicSession = (value: SessionItem): PublicSession =>
   pickPublicFields(value, PUBLIC_SESSION_FIELDS);
 
 export const projectPublicTopic = (value: TopicItem): PublicTopic =>
   pickPublicFields(value, PUBLIC_TOPIC_FIELDS);
 
-export const projectPublicMessage = (value: MessageItem): PublicMessage =>
+export const projectPublicMessage = (value: PublicMessage): PublicMessage =>
   pickPublicFields(value, PUBLIC_MESSAGE_FIELDS);
 
 export const projectPublicEvalRun = (value: AgentEvalRunItem): PublicEvalRun =>

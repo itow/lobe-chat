@@ -1,6 +1,4 @@
-import { Flexbox } from '@lobehub/ui';
-import { ActionIcon, Text } from '@lobehub/ui/base-ui';
-import { createStaticStyles, cssVar } from 'antd-style';
+import { ActionIcon, createStaticStyles, cssVar, Flexbox, Text } from '@lobehub/ui';
 import { ArrowLeft } from 'lucide-react';
 import { memo } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -28,7 +26,7 @@ const styles = createStaticStyles(({ css }) => ({
 }));
 
 const TopicCommentsSidebar = memo(() => {
-  const { t } = useTranslation('chat');
+  const { t } = useTranslation(['chat', 'common']);
   const view = useChatStore(chatPortalSelectors.currentView);
   const [goBack, openTopicComments] = useChatStore((s) => [s.goBack, s.openTopicComments]);
 
@@ -50,6 +48,7 @@ const TopicCommentsSidebar = memo(() => {
         <ActionIcon
           icon={ArrowLeft}
           size={DESKTOP_HEADER_ICON_SMALL_SIZE}
+          title={t('back', { ns: 'common' })}
           onClick={isThread ? goBack : () => openTopicComments(view.topicId)}
         />
         <Text fontSize={13} weight={500}>

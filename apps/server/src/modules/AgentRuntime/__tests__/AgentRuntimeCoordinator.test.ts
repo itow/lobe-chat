@@ -1,8 +1,19 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import type { AgentRuntimeCoordinatorOptions } from '../AgentRuntimeCoordinator';
 import { AgentRuntimeCoordinator } from '../AgentRuntimeCoordinator';
 import { createAgentStateManager, createStreamEventManager } from '../factory';
 import { VISIBLE_OUTPUT_END_PUBLISHED_STEP_INDEX_METADATA_KEY } from '../visibleOutputEnd';
+
+const resolverOptions = (
+  stateManager: AgentRuntimeCoordinatorOptions['stateManager'],
+  streamEventManager: AgentRuntimeCoordinatorOptions['streamEventManager'],
+  uiMessagesResolver: AgentRuntimeCoordinatorOptions['uiMessagesResolver'],
+) => ({
+  stateManager,
+  streamEventManager,
+  uiMessagesResolver,
+});
 
 // Mock factory module to avoid Redis/env access
 vi.mock('../factory', () => ({
@@ -30,7 +41,10 @@ describe('AgentRuntimeCoordinator', () => {
       getStats: vi.fn(),
       isInterrupted: vi.fn(),
       loadAgentState: vi.fn(),
+      loadAgentStatus: vi.fn(),
       markInterrupted: vi.fn(),
+      hasQueuedMessages: vi.fn(),
+      setQueuedMessages: vi.fn(),
       saveAgentState: vi.fn(),
       saveStepResult: vi.fn(),
     };
@@ -74,6 +88,25 @@ describe('AgentRuntimeCoordinator', () => {
       expect(mockStreamManager.publishAgentRuntimeInit).toHaveBeenCalledWith(operationId, metadata);
     });
 
+    it('adds the routing meta to the init event without persisting it', async () => {
+      const operationId = 'test-operation-id';
+      const data = { userId: 'user-123' };
+      const metadata = { createdAt: '2024-01-01T00:00:00.000Z', status: 'idle', ...data };
+      mockStateManager.getOperationMetadata.mockResolvedValue(metadata);
+
+      await coordinator.createAgentOperation(operationId, data, {
+        agentId: 'agt_1',
+        topicId: 'tpc_1',
+      });
+
+      expect(mockStateManager.createOperationMetadata).toHaveBeenCalledWith(operationId, data);
+      expect(mockStreamManager.publishAgentRuntimeInit).toHaveBeenCalledWith(operationId, {
+        ...metadata,
+        agentId: 'agt_1',
+        topicId: 'tpc_1',
+      });
+    });
+
     it('should not publish init event if metadata creation fails', async () => {
       const operationId = 'test-operation-id';
       const data = { userId: 'user-123' };
@@ -93,10 +126,11 @@ describe('AgentRuntimeCoordinator', () => {
       const previousState = { status: 'running', stepCount: 3 };
       const newState = { status: 'done', stepCount: 5 };
 
-      mockStateManager.loadAgentState.mockResolvedValue(previousState);
+      mockStateManager.loadAgentStatus.mockResolvedValue(previousState.status);
 
       await coordinator.saveAgentState(operationId, newState as any);
 
+      expect(mockStateManager.loadAgentState).not.toHaveBeenCalled();
       expect(mockStateManager.saveAgentState).toHaveBeenCalledWith(operationId, newState);
       expect(mockStreamManager.publishAgentRuntimeEnd).toHaveBeenCalledWith({
         finalState: newState,
@@ -114,7 +148,7 @@ describe('AgentRuntimeCoordinator', () => {
       const error = new Error('redis down');
       const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-      mockStateManager.loadAgentState.mockResolvedValue(previousState);
+      mockStateManager.loadAgentStatus.mockResolvedValue(previousState.status);
       mockStreamManager.publishStreamEvent.mockRejectedValueOnce(error);
 
       try {
@@ -137,7 +171,7 @@ describe('AgentRuntimeCoordinator', () => {
       const previousState = { status: 'running', stepCount: 3 };
       const newState = { error: { message: 'boom' }, status: 'error', stepCount: 5 };
 
-      mockStateManager.loadAgentState.mockResolvedValue(previousState);
+      mockStateManager.loadAgentStatus.mockResolvedValue(previousState.status);
 
       await coordinator.saveAgentState(operationId, newState as any);
 
@@ -155,6 +189,7 @@ describe('AgentRuntimeCoordinator', () => {
       const previousState = { status: 'running', stepCount: 3 };
       const newState = { error: { message: 'boom' }, status: 'error' };
 
+      mockStateManager.loadAgentStatus.mockResolvedValue(previousState.status);
       mockStateManager.loadAgentState.mockResolvedValue(previousState);
 
       await coordinator.saveAgentState(operationId, newState as any);
@@ -173,7 +208,7 @@ describe('AgentRuntimeCoordinator', () => {
       const previousState = { status: 'running', stepCount: 3 };
       const newState = { status: 'interrupted', stepCount: 5 };
 
-      mockStateManager.loadAgentState.mockResolvedValue(previousState);
+      mockStateManager.loadAgentStatus.mockResolvedValue(previousState.status);
 
       await coordinator.saveAgentState(operationId, newState as any);
 
@@ -191,7 +226,7 @@ describe('AgentRuntimeCoordinator', () => {
       const previousState = { status: 'running', stepCount: 3 };
       const newState = { status: 'waiting_for_human', stepCount: 4 };
 
-      mockStateManager.loadAgentState.mockResolvedValue(previousState);
+      mockStateManager.loadAgentStatus.mockResolvedValue(previousState.status);
 
       await coordinator.saveAgentState(operationId, newState as any);
 
@@ -209,7 +244,7 @@ describe('AgentRuntimeCoordinator', () => {
       const previousState = { status: 'running', stepCount: 3 };
       const newState = { status: 'waiting_for_async_tool', stepCount: 4 };
 
-      mockStateManager.loadAgentState.mockResolvedValue(previousState);
+      mockStateManager.loadAgentStatus.mockResolvedValue(previousState.status);
 
       await coordinator.saveAgentState(operationId, newState as any);
 
@@ -222,7 +257,7 @@ describe('AgentRuntimeCoordinator', () => {
       const previousState = { status: 'done', stepCount: 5 };
       const newState = { status: 'error', stepCount: 5 };
 
-      mockStateManager.loadAgentState.mockResolvedValue(previousState);
+      mockStateManager.loadAgentStatus.mockResolvedValue(previousState.status);
 
       await coordinator.saveAgentState(operationId, newState as any);
 
@@ -235,7 +270,7 @@ describe('AgentRuntimeCoordinator', () => {
       const previousState = { status: 'idle', stepCount: 0 };
       const newState = { status: 'running', stepCount: 1 };
 
-      mockStateManager.loadAgentState.mockResolvedValue(previousState);
+      mockStateManager.loadAgentStatus.mockResolvedValue(previousState.status);
 
       await coordinator.saveAgentState(operationId, newState as any);
 
@@ -254,11 +289,13 @@ describe('AgentRuntimeCoordinator', () => {
       };
 
       // Mock previous state as running
-      mockStateManager.loadAgentState.mockResolvedValue({ status: 'running', stepCount: 4 });
+      mockStateManager.loadAgentStatus.mockResolvedValue('running');
 
       await coordinator.saveStepResult(operationId, stepResult as any);
 
-      expect(mockStateManager.loadAgentState).toHaveBeenCalledWith(operationId);
+      // Only the previous status is read; the state blob is not downloaded.
+      expect(mockStateManager.loadAgentStatus).toHaveBeenCalledWith(operationId);
+      expect(mockStateManager.loadAgentState).not.toHaveBeenCalled();
       expect(mockStateManager.saveStepResult).toHaveBeenCalledWith(operationId, stepResult);
       expect(mockStreamManager.publishAgentRuntimeEnd).toHaveBeenCalledWith({
         finalState: stepResult.newState,
@@ -279,7 +316,7 @@ describe('AgentRuntimeCoordinator', () => {
       const error = new Error('redis down');
       const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-      mockStateManager.loadAgentState.mockResolvedValue({ status: 'running', stepCount: 4 });
+      mockStateManager.loadAgentStatus.mockResolvedValue('running');
       mockStreamManager.publishStreamEvent.mockRejectedValueOnce(error);
 
       try {
@@ -309,7 +346,7 @@ describe('AgentRuntimeCoordinator', () => {
         stepIndex: 5,
       };
 
-      mockStateManager.loadAgentState.mockResolvedValue({ status: 'running', stepCount: 4 });
+      mockStateManager.loadAgentStatus.mockResolvedValue('running');
 
       await coordinator.saveStepResult(operationId, stepResult as any);
 
@@ -338,7 +375,7 @@ describe('AgentRuntimeCoordinator', () => {
         stepIndex: 0,
       };
 
-      mockStateManager.loadAgentState.mockResolvedValue({ status: 'running', stepCount: 0 });
+      mockStateManager.loadAgentStatus.mockResolvedValue('running');
 
       await coordinator.saveStepResult(operationId, stepResult as any);
 
@@ -367,7 +404,7 @@ describe('AgentRuntimeCoordinator', () => {
         stepIndex: 5,
       };
 
-      mockStateManager.loadAgentState.mockResolvedValue({ status: 'running', stepCount: 4 });
+      mockStateManager.loadAgentStatus.mockResolvedValue('running');
 
       await coordinator.saveStepResult(operationId, stepResult as any);
 
@@ -392,7 +429,7 @@ describe('AgentRuntimeCoordinator', () => {
         stepIndex: 5,
       };
 
-      mockStateManager.loadAgentState.mockResolvedValue({ status: 'running', stepCount: 4 });
+      mockStateManager.loadAgentStatus.mockResolvedValue('running');
 
       await coordinator.saveStepResult(operationId, stepResult as any);
 
@@ -413,7 +450,7 @@ describe('AgentRuntimeCoordinator', () => {
         stepIndex: 5,
       };
 
-      mockStateManager.loadAgentState.mockResolvedValue({ status: 'running', stepCount: 4 });
+      mockStateManager.loadAgentStatus.mockResolvedValue('running');
 
       await coordinator.saveStepResult(operationId, stepResult as any);
 
@@ -434,7 +471,7 @@ describe('AgentRuntimeCoordinator', () => {
         stepIndex: 4,
       };
 
-      mockStateManager.loadAgentState.mockResolvedValue({ status: 'running', stepCount: 3 });
+      mockStateManager.loadAgentStatus.mockResolvedValue('running');
 
       await coordinator.saveStepResult(operationId, stepResult as any);
 
@@ -455,7 +492,7 @@ describe('AgentRuntimeCoordinator', () => {
         stepIndex: 4,
       };
 
-      mockStateManager.loadAgentState.mockResolvedValue({ status: 'running', stepCount: 3 });
+      mockStateManager.loadAgentStatus.mockResolvedValue('running');
 
       await coordinator.saveStepResult(operationId, stepResult as any);
 
@@ -471,7 +508,7 @@ describe('AgentRuntimeCoordinator', () => {
         stepIndex: 5,
       };
 
-      mockStateManager.loadAgentState.mockResolvedValue({ status: 'running', stepCount: 4 });
+      mockStateManager.loadAgentStatus.mockResolvedValue('running');
 
       await coordinator.saveStepResult(operationId, stepResult as any);
 
@@ -492,7 +529,7 @@ describe('AgentRuntimeCoordinator', () => {
         stepIndex: 3,
       };
 
-      mockStateManager.loadAgentState.mockResolvedValue({ status: 'running', stepCount: 2 });
+      mockStateManager.loadAgentStatus.mockResolvedValue('running');
 
       await coordinator.saveStepResult(operationId, stepResult as any);
 
@@ -509,7 +546,7 @@ describe('AgentRuntimeCoordinator', () => {
       };
 
       // Mock previous state as already done
-      mockStateManager.loadAgentState.mockResolvedValue({ status: 'done', stepCount: 5 });
+      mockStateManager.loadAgentStatus.mockResolvedValue('done');
 
       await coordinator.saveStepResult(operationId, stepResult as any);
 
@@ -590,15 +627,13 @@ describe('AgentRuntimeCoordinator', () => {
             resolveUiMessages = resolve;
           }),
       );
-      const coordinatorWithResolver = new AgentRuntimeCoordinator({
-        stateManager: mockStateManager,
-        streamEventManager: mockStreamManager,
-        uiMessagesResolver: resolver,
-      });
+      const coordinatorWithResolver = new AgentRuntimeCoordinator(
+        resolverOptions(mockStateManager, mockStreamManager, resolver),
+      );
 
       const previousState = { status: 'running', stepCount: 3 };
       const newState = { status: 'done', stepCount: 5 };
-      mockStateManager.loadAgentState.mockResolvedValue(previousState);
+      mockStateManager.loadAgentStatus.mockResolvedValue(previousState.status);
 
       const savePromise = coordinatorWithResolver.saveAgentState('op-1', newState as any);
 
@@ -620,15 +655,13 @@ describe('AgentRuntimeCoordinator', () => {
     it('passes resolver result through saveAgentState terminal publish', async () => {
       const uiMessages = [{ id: 'msg_1', role: 'user' }] as any[];
       const resolver = vi.fn().mockResolvedValue(uiMessages);
-      const coordinatorWithResolver = new AgentRuntimeCoordinator({
-        stateManager: mockStateManager,
-        streamEventManager: mockStreamManager,
-        uiMessagesResolver: resolver,
-      });
+      const coordinatorWithResolver = new AgentRuntimeCoordinator(
+        resolverOptions(mockStateManager, mockStreamManager, resolver),
+      );
 
       const previousState = { status: 'running', stepCount: 3 };
       const newState = { status: 'done', stepCount: 5 };
-      mockStateManager.loadAgentState.mockResolvedValue(previousState);
+      mockStateManager.loadAgentStatus.mockResolvedValue(previousState.status);
 
       await coordinatorWithResolver.saveAgentState('op-1', newState as any);
 
@@ -645,18 +678,16 @@ describe('AgentRuntimeCoordinator', () => {
     it('passes resolver result through saveStepResult terminal publish', async () => {
       const uiMessages = [{ id: 'msg_a', role: 'assistantGroup' }] as any[];
       const resolver = vi.fn().mockResolvedValue(uiMessages);
-      const coordinatorWithResolver = new AgentRuntimeCoordinator({
-        stateManager: mockStateManager,
-        streamEventManager: mockStreamManager,
-        uiMessagesResolver: resolver,
-      });
+      const coordinatorWithResolver = new AgentRuntimeCoordinator(
+        resolverOptions(mockStateManager, mockStreamManager, resolver),
+      );
 
       const stepResult = {
         executionTime: 100,
         newState: { status: 'done', stepCount: 4 },
         stepIndex: 4,
       };
-      mockStateManager.loadAgentState.mockResolvedValue({ status: 'running', stepCount: 3 });
+      mockStateManager.loadAgentStatus.mockResolvedValue('running');
 
       await coordinatorWithResolver.saveStepResult('op-2', stepResult as any);
 
@@ -670,17 +701,42 @@ describe('AgentRuntimeCoordinator', () => {
       });
     });
 
-    it('publishes with uiMessages=undefined when resolver rejects (must never fail the surrounding save)', async () => {
-      const resolver = vi.fn().mockRejectedValue(new Error('db down'));
+    it('marks a protocol-v2 patched terminal event with its expected revision', async () => {
       const coordinatorWithResolver = new AgentRuntimeCoordinator({
+        messagePatchModeResolver: vi.fn().mockReturnValue(true),
         stateManager: mockStateManager,
         streamEventManager: mockStreamManager,
-        uiMessagesResolver: resolver,
+        uiMessagesResolver: vi.fn().mockResolvedValue(undefined),
       });
+      const stepResult = {
+        executionTime: 100,
+        newState: { status: 'done', stepCount: 4 },
+        stepIndex: 4,
+      };
+      mockStateManager.loadAgentStatus.mockResolvedValue('running');
+
+      await coordinatorWithResolver.saveStepResult('op-patch', stepResult as any);
+
+      expect(mockStreamManager.publishAgentRuntimeEnd).toHaveBeenCalledWith({
+        finalState: stepResult.newState,
+        messagePatchMode: true,
+        messageRevision: 5,
+        operationId: 'op-patch',
+        reason: 'done',
+        stepIndex: 4,
+        uiMessages: undefined,
+      });
+    });
+
+    it('publishes with uiMessages=undefined when resolver rejects (must never fail the surrounding save)', async () => {
+      const resolver = vi.fn().mockRejectedValue(new Error('db down'));
+      const coordinatorWithResolver = new AgentRuntimeCoordinator(
+        resolverOptions(mockStateManager, mockStreamManager, resolver),
+      );
 
       const previousState = { status: 'running', stepCount: 3 };
       const newState = { status: 'error', stepCount: 5 };
-      mockStateManager.loadAgentState.mockResolvedValue(previousState);
+      mockStateManager.loadAgentStatus.mockResolvedValue(previousState.status);
 
       await coordinatorWithResolver.saveAgentState('op-3', newState as any);
 
@@ -700,7 +756,7 @@ describe('AgentRuntimeCoordinator', () => {
       // legacy call sites stay unaffected.
       const previousState = { status: 'running', stepCount: 3 };
       const newState = { status: 'done', stepCount: 5 };
-      mockStateManager.loadAgentState.mockResolvedValue(previousState);
+      mockStateManager.loadAgentStatus.mockResolvedValue(previousState.status);
 
       await coordinator.saveAgentState('op-4', newState as any);
 
@@ -720,15 +776,13 @@ describe('AgentRuntimeCoordinator', () => {
     // content, so the resolver is skipped entirely for status='interrupted'.
     it('skips uiMessages on saveAgentState when status=interrupted', async () => {
       const resolver = vi.fn().mockResolvedValue([{ id: 'placeholder', role: 'assistant' }]);
-      const coordinatorWithResolver = new AgentRuntimeCoordinator({
-        stateManager: mockStateManager,
-        streamEventManager: mockStreamManager,
-        uiMessagesResolver: resolver,
-      });
+      const coordinatorWithResolver = new AgentRuntimeCoordinator(
+        resolverOptions(mockStateManager, mockStreamManager, resolver),
+      );
 
       const previousState = { status: 'running', stepCount: 3 };
       const newState = { status: 'interrupted', stepCount: 3 };
-      mockStateManager.loadAgentState.mockResolvedValue(previousState);
+      mockStateManager.loadAgentStatus.mockResolvedValue(previousState.status);
 
       await coordinatorWithResolver.saveAgentState('op-int-1', newState as any);
 
@@ -746,18 +800,16 @@ describe('AgentRuntimeCoordinator', () => {
 
     it('skips uiMessages on saveStepResult when stepResult.newState.status=interrupted', async () => {
       const resolver = vi.fn().mockResolvedValue([{ id: 'placeholder', role: 'assistant' }]);
-      const coordinatorWithResolver = new AgentRuntimeCoordinator({
-        stateManager: mockStateManager,
-        streamEventManager: mockStreamManager,
-        uiMessagesResolver: resolver,
-      });
+      const coordinatorWithResolver = new AgentRuntimeCoordinator(
+        resolverOptions(mockStateManager, mockStreamManager, resolver),
+      );
 
       const stepResult = {
         executionTime: 100,
         newState: { status: 'interrupted', stepCount: 2 },
         stepIndex: 2,
       };
-      mockStateManager.loadAgentState.mockResolvedValue({ status: 'running', stepCount: 1 });
+      mockStateManager.loadAgentStatus.mockResolvedValue('running');
 
       await coordinatorWithResolver.saveStepResult('op-int-2', stepResult as any);
 

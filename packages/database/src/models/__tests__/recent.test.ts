@@ -229,6 +229,13 @@ describe('RecentModel', () => {
             updatedAt: now(),
           },
           {
+            id: 'topic-channel',
+            userId,
+            agentId: 'agent-inbox',
+            trigger: 'channel',
+            updatedAt: now(),
+          },
+          {
             id: 'topic-chat',
             userId,
             agentId: 'agent-inbox',
@@ -239,6 +246,52 @@ describe('RecentModel', () => {
 
         const result = await recentModel.queryRecent();
         expect(result.map((r) => r.id)).toEqual(['topic-chat']);
+      });
+
+      it('keeps archived topics unless excludeArchived is set', async () => {
+        await serverDB.insert(agents).values({ id: 'agent-inbox', userId, slug: 'inbox' });
+        await serverDB.insert(topics).values([
+          {
+            agentId: 'agent-inbox',
+            id: 'topic-active',
+            status: 'active',
+            updatedAt: minutesAgo(1),
+            userId,
+          },
+          { agentId: 'agent-inbox', id: 'topic-null', updatedAt: minutesAgo(2), userId },
+          {
+            agentId: 'agent-inbox',
+            id: 'topic-completed',
+            status: 'completed',
+            updatedAt: minutesAgo(3),
+            userId,
+          },
+          {
+            agentId: 'agent-inbox',
+            id: 'topic-archived',
+            status: 'archived',
+            updatedAt: minutesAgo(4),
+            userId,
+          },
+          {
+            agentId: 'agent-inbox',
+            id: 'topic-unread',
+            status: 'unread',
+            updatedAt: minutesAgo(5),
+            userId,
+          },
+        ]);
+
+        const all = await recentModel.queryRecent(10, ['topic']);
+        expect(all.map((r) => r.id)).toEqual([
+          'topic-active',
+          'topic-null',
+          'topic-completed',
+          'topic-archived',
+        ]);
+
+        const unarchived = await recentModel.queryRecent(10, ['topic'], false, false, false, true);
+        expect(unarchived.map((r) => r.id)).toEqual(['topic-active', 'topic-null']);
       });
 
       it('falls back to "Untitled Topic" when title is null', async () => {
@@ -432,6 +485,7 @@ describe('RecentModel', () => {
         expect(result).toHaveLength(1);
         expect(result[0]).toMatchObject({
           id: 'task-active',
+          taskIdentifier: 'T-1',
           type: 'task',
           title: 'Active Task',
           routeId: 'agent-assignee',
@@ -526,6 +580,13 @@ describe('RecentModel', () => {
         const byId = Object.fromEntries(result.map((r) => [r.id, r.title]));
         expect(byId['task-named']).toBe('Named');
         expect(byId['task-instruction']).toBe('fallback to instruction');
+
+        // `slugTitle` deliberately does NOT take that fallback: it feeds the
+        // task link, and a prompt body in the path would reach browser history,
+        // analytics page views and every copied link.
+        const slugById = Object.fromEntries(result.map((r) => [r.id, r.slugTitle]));
+        expect(slugById['task-named']).toBe('Named');
+        expect(slugById['task-instruction']).toBeNull();
       });
     });
 
@@ -721,6 +782,79 @@ describe('RecentModel', () => {
 
         expect(result.map((r) => r.id)).toEqual(['topic-ws-mine']);
         expect(result[0].userId).toBe(userId);
+      });
+
+      describe('sharedOnly (team tab)', () => {
+        // The parent lives in the SAME workspace — only its visibility marks it
+        // as a personal conversation. `buildWorkspaceWhere` keeps a member's own
+        // private rows visible, so the owner's own private agent is the one case
+        // the workspace predicate cannot catch on its own.
+        beforeEach(async () => {
+          await serverDB.insert(agents).values([
+            { id: 'agent-ws-private-mine', userId, visibility: 'private', workspaceId },
+            {
+              id: 'agent-ws-private-other',
+              userId: otherUserId,
+              visibility: 'private',
+              workspaceId,
+            },
+          ]);
+          await serverDB
+            .insert(chatGroups)
+            .values([{ id: 'group-ws-private-mine', userId, visibility: 'private', workspaceId }]);
+          await serverDB.insert(topics).values([
+            {
+              agentId: 'agent-ws-private-mine',
+              description: 'Private agent conversation summary',
+              id: 'topic-private-agent-mine',
+              title: 'Private agent conversation',
+              updatedAt: minutesAgo(3),
+              userId,
+              workspaceId,
+            },
+            {
+              agentId: 'agent-ws-private-other',
+              id: 'topic-private-agent-other',
+              title: 'Teammate private agent conversation',
+              updatedAt: minutesAgo(4),
+              userId: otherUserId,
+              workspaceId,
+            },
+            {
+              groupId: 'group-ws-private-mine',
+              id: 'topic-private-group-mine',
+              title: 'Private group conversation',
+              updatedAt: minutesAgo(5),
+              userId,
+              workspaceId,
+            },
+          ]);
+        });
+
+        it('keeps the viewer own private-agent topics without sharedOnly', async () => {
+          const result = await workspaceModel.queryRecent(10, ['topic']);
+
+          expect(result.map((r) => r.id)).toContain('topic-private-agent-mine');
+          expect(result.map((r) => r.id)).toContain('topic-private-group-mine');
+        });
+
+        it('drops topics owned by a private agent or group, including the viewer own', async () => {
+          const result = await workspaceModel.queryRecent(10, ['topic'], true, false, true);
+
+          expect(result.map((r) => r.id)).toEqual(['topic-ws-mine', 'topic-ws-other']);
+          expect(result.map((r) => r.title)).not.toContain('Private agent conversation');
+          expect(result.map((r) => r.description)).not.toContain(
+            'Private agent conversation summary',
+          );
+        });
+
+        it('never exposes a teammate private-agent topic in either mode', async () => {
+          const teamFeed = await workspaceModel.queryRecent(10, ['topic'], false, false, true);
+          const sidebarFeed = await workspaceModel.queryRecent(10, ['topic']);
+
+          expect(teamFeed.map((r) => r.id)).not.toContain('topic-private-agent-other');
+          expect(sidebarFeed.map((r) => r.id)).not.toContain('topic-private-agent-other');
+        });
       });
 
       it.each(['agent', 'group'] as const)(

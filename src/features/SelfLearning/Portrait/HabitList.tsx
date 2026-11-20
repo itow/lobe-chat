@@ -1,8 +1,20 @@
 'use client';
 
-import { Block, Flexbox, Icon, SearchBar, Tooltip } from '@lobehub/ui';
-import type { DropdownItem } from '@lobehub/ui/base-ui';
-import { ActionIcon, Button, DropdownMenu, Popover, Tag, Text, toast } from '@lobehub/ui/base-ui';
+import type { DropdownItem } from '@lobehub/ui';
+import {
+  ActionIcon,
+  Block,
+  Button,
+  DropdownMenu,
+  Flexbox,
+  Icon,
+  Popover,
+  SearchBar,
+  Tag,
+  Text,
+  toast,
+  Tooltip,
+} from '@lobehub/ui';
 import dayjs from 'dayjs';
 import {
   ArchiveIcon,
@@ -20,6 +32,7 @@ import urlJoin from 'url-join';
 import { useWorkspaceAwareNavigate } from '@/features/Workspace/useWorkspaceAwareNavigate';
 import type { ExpertiseHabit } from '@/services/expertise';
 import { expertiseService } from '@/services/expertise';
+import { expertiseActions } from '@/store/expertise';
 
 import { countTiers, type HabitTier, habitTier, TIER_ORDER } from '../helpers';
 import LessonPreview from './LessonPreview';
@@ -33,7 +46,6 @@ interface HabitListProps {
   /** Present when the list mixes several domains, so each row can say which one it belongs to. */
   domainTitles?: Record<string, string>;
   habits: (ExpertiseHabit & { domainId: string })[];
-  onChanged: () => void;
   /** Where the complete, unfolded list lives; renders a "view all" link in the header. */
   viewAllPath?: string;
 }
@@ -68,11 +80,10 @@ interface HabitRowProps {
   agentId: string;
   domainTitle?: string;
   habit: ExpertiseHabit & { domainId: string };
-  onChanged: () => void;
   tier: HabitTier;
 }
 
-const HabitRow = memo<HabitRowProps>(({ agentId, domainTitle, habit, onChanged, tier }) => {
+const HabitRow = memo<HabitRowProps>(({ agentId, domainTitle, habit, tier }) => {
   const { t } = useTranslation('selfLearning');
   const navigate = useWorkspaceAwareNavigate();
   const [teaching, setTeaching] = useState(false);
@@ -107,7 +118,7 @@ const HabitRow = memo<HabitRowProps>(({ agentId, domainTitle, habit, onChanged, 
       await expertiseService.reviseLesson({ lessonId: habit.id, text });
       toast.success(t('habit.teach.done'));
       setTeaching(false);
-      onChanged();
+      void expertiseActions.afterLessonWrite(agentId, habit.id);
     } catch {
       toast.error(t('habit.teach.failed'));
     }
@@ -115,9 +126,9 @@ const HabitRow = memo<HabitRowProps>(({ agentId, domainTitle, habit, onChanged, 
 
   const retire = async () => {
     try {
-      await expertiseService.retireLesson(habit.id);
+      // Drops from the portrait (and its local copy) at once; comes back if the call fails.
+      await expertiseActions.retireLesson(agentId, habit.id);
       toast.success(t('habit.teach.forgot'));
-      onChanged();
     } catch {
       toast.error(t('habit.teach.failed'));
     }
@@ -163,11 +174,12 @@ const HabitRow = memo<HabitRowProps>(({ agentId, domainTitle, habit, onChanged, 
         <Popover
           // Long enough that dragging the pointer down the list does not fetch every row.
           openDelay={420}
-          // Above the row rather than below it: the row's own hint sits directly beneath the
-          // title, so a card there buries the line the reader just came from.
-          placement={'topRight'}
-          // This stack never flips a popup to the opposite side, so the card has to fit in the
-          // space above the row; the padding keeps it clear of the viewport edge.
+          // Below the row by preference, so the row the reader is pointing at stays visible
+          // while they move into the card.
+          placement={'bottomRight'}
+          // Preference, not a rule: reading down a list parks the pointer on the last visible
+          // row, and pinning the card downward there pushes its body off-screen. Base UI's
+          // default side avoidance flips it back above when the space below runs out.
           positionerProps={{ collisionPadding: 12 }}
           trigger={'hover'}
           content={
@@ -249,7 +261,7 @@ HabitRow.displayName = 'ExpertiseHabitRow';
  * 值得看的都在上面，稳的收起来 —— 用户不需要有精力逐条过。
  */
 const HabitList = memo<HabitListProps>(
-  ({ agentId, defaultStableOpen = false, domainTitles, habits, onChanged, viewAllPath }) => {
+  ({ agentId, defaultStableOpen = false, domainTitles, habits, viewAllPath }) => {
     const { t } = useTranslation('selfLearning');
     const [search, setSearch] = useState('');
     const [stableOpen, setStableOpen] = useState(defaultStableOpen);
@@ -321,7 +333,6 @@ const HabitList = memo<HabitListProps>(
                     habit={h}
                     key={h.id}
                     tier={tier}
-                    onChanged={onChanged}
                   />
                 ))}
               </Fragment>
@@ -355,7 +366,6 @@ const HabitList = memo<HabitListProps>(
                 habit={h}
                 key={h.id}
                 tier={'stable'}
-                onChanged={onChanged}
               />
             ))}
         </Block>

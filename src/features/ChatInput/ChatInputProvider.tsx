@@ -7,7 +7,6 @@ import { createStore, Provider } from './store';
 import { DEFAULT_CHAT_INPUT_FEATURE } from './store/initialState';
 import type { StoreUpdaterProps } from './StoreUpdater';
 import StoreUpdater from './StoreUpdater';
-import { useEditorRootLifecycle } from './useEditorRootLifecycle';
 
 interface ChatInputProviderProps extends StoreUpdaterProps {
   children: ReactNode;
@@ -19,7 +18,7 @@ export const ChatInputProvider = memo<ChatInputProviderProps>(
     canRecordVoiceMessage,
     children,
     contextSelectionKey,
-    contextWindowMessages,
+    contextWindow,
     draftKey,
     feature = DEFAULT_CHAT_INPUT_FEATURE,
     leftActions,
@@ -28,18 +27,19 @@ export const ChatInputProvider = memo<ChatInputProviderProps>(
     sendButtonProps,
     onSend,
     onVoiceMessageSend,
-    sendMenu,
     chatInputEditorRef,
     onMarkdownContentChange,
     mentionItems,
     allowExpand = true,
     slashPlacement,
     getMessages,
+    queueSendWhileUploading,
     resolveSendBlocked,
+    topicId,
+    uploadContextKey,
   }) => {
     const editor = useEditor();
     const slashMenuRef = useRef<HTMLDivElement>(null);
-    useEditorRootLifecycle(editor);
 
     return (
       <Provider
@@ -48,7 +48,7 @@ export const ChatInputProvider = memo<ChatInputProviderProps>(
             allowExpand,
             canRecordVoiceMessage,
             contextSelectionKey,
-            contextWindowMessages,
+            contextWindow,
             draftKey,
             editor,
             feature,
@@ -58,9 +58,10 @@ export const ChatInputProvider = memo<ChatInputProviderProps>(
             rightActions,
             onVoiceMessageSend,
             sendButtonProps,
-            sendMenu,
             slashMenuRef,
             slashPlacement,
+            topicId,
+            uploadContextKey,
           })
         }
       >
@@ -70,18 +71,20 @@ export const ChatInputProvider = memo<ChatInputProviderProps>(
           canRecordVoiceMessage={canRecordVoiceMessage}
           chatInputEditorRef={chatInputEditorRef}
           contextSelectionKey={contextSelectionKey}
-          contextWindowMessages={contextWindowMessages}
+          contextWindow={contextWindow}
           draftKey={draftKey}
           feature={feature}
           getMessages={getMessages}
           leftActions={leftActions}
           mentionItems={mentionItems}
           mobile={mobile}
+          queueSendWhileUploading={queueSendWhileUploading}
           resolveSendBlocked={resolveSendBlocked}
           rightActions={rightActions}
           sendButtonProps={sendButtonProps}
-          sendMenu={sendMenu}
           slashPlacement={slashPlacement}
+          topicId={topicId}
+          uploadContextKey={uploadContextKey}
           onMarkdownContentChange={onMarkdownContentChange}
           onSend={onSend}
           onVoiceMessageSend={onVoiceMessageSend}

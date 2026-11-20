@@ -1,9 +1,9 @@
 'use client';
 
-import { Flexbox, TextArea } from '@lobehub/ui';
-import { ActionIcon, Button, Segmented, Text } from '@lobehub/ui/base-ui';
-import { createStaticStyles, cssVar } from 'antd-style';
-import { ChevronLeft, ChevronRight, ZoomIn, ZoomOut } from 'lucide-react';
+import { ActionIcon, Button, Text, TextArea } from '@lobehub/ui';
+import { cssVar } from '@lobehub/ui/stylex/cssVar.stylex';
+import * as stylex from '@stylexjs/stylex';
+import { ChevronLeft, ChevronRight, PencilLine, ZoomIn, ZoomOut } from 'lucide-react';
 import { memo } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -13,73 +13,148 @@ import { AttachmentStrip, AttachmentUploadButton } from './attachments';
 import { EvidenceStage } from './EvidenceStage';
 import { MobileRegionNotes } from './RegionNotes';
 
-const styles = createStaticStyles(({ css }) => ({
-  body: css`
-    display: flex;
-    flex: 1;
-    flex-direction: column;
+const TOUCH_ICON = { blockSize: 44, size: 20 };
 
-    min-width: 0;
-    min-height: 0;
-  `,
-  /** The one scroll on the page — image on top, the notes it earns below it. */
-  scroll: css`
-    overflow-y: auto;
-    overscroll-behavior: contain;
-    display: flex;
-    flex: 1;
-    flex-direction: column;
-    gap: 8px;
+const styles = stylex.create({
+  body: {
+    display: 'flex',
+    flex: '1',
+    flexDirection: 'column',
+    minWidth: 0,
+    minHeight: 0,
+  },
+  // The modal shell already pads the content 12px inline; 4px more makes the
+  // 16px column, and the footer's negative margin takes its rule edge to edge.
+  scroll: {
+    overflowY: 'auto',
+    overscrollBehavior: 'contain',
+    display: 'flex',
+    flex: '1',
+    flexDirection: 'column',
+    gap: '12px',
+    minHeight: 0,
+    paddingBlock: '16px',
+    paddingInline: '4px',
+  },
+  // A zero basis keeps the stage's height a matter of layout alone: the image
+  // is fitted to the measured stage, so a content-sized stage would feed back.
+  stage: {
+    display: 'flex',
+    flexGrow: '1',
+    flexShrink: '1',
+    flexBasis: '0px',
+    minHeight: 'min(340px, 45dvh)',
+  },
+  switcher: {
+    display: 'flex',
+    flex: 'none',
+    alignItems: 'center',
+    width: '100%',
+    minHeight: '44px',
+    borderWidth: '1px',
+    borderStyle: 'solid',
+    borderColor: cssVar.colorBorderSecondary,
+    borderRadius: cssVar.borderRadius,
+  },
+  counter: {
+    flex: 'none',
+    minWidth: '32px',
+    fontSize: '12px',
+    fontVariantNumeric: 'tabular-nums',
+    lineHeight: '20px',
+    color: cssVar.colorTextSecondary,
+    textAlign: 'center',
+    whiteSpace: 'nowrap',
+  },
+  spacer: {
+    flex: '1',
+  },
+  zoomValue: {
+    flex: 'none',
+    minWidth: '44px',
+    fontSize: '12px',
+    fontVariantNumeric: 'tabular-nums',
+    lineHeight: '20px',
+    color: cssVar.colorText,
+    textAlign: 'center',
+  },
+  drawButton: {
+    flex: 'none',
+    width: '100%',
+    minHeight: '44px',
+  },
+  section: {
+    display: 'flex',
+    flex: 'none',
+    flexDirection: 'column',
+  },
+  sectionTitle: {
+    fontSize: '14px',
+    fontWeight: 600,
+    lineHeight: '22px',
+    color: cssVar.colorText,
+  },
+  regionList: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '12px',
+    marginBlockStart: '8px',
+  },
+  regionEmpty: {
+    marginBlockStart: '4px',
+    fontSize: '12px',
+    lineHeight: '20px',
+    color: cssVar.colorTextSecondary,
+  },
+  label: {
+    marginBlockEnd: '4px',
+    fontSize: '12px',
+    lineHeight: '20px',
+    color: cssVar.colorTextSecondary,
+  },
+  caption: {
+    marginBlockStart: '4px',
+    fontSize: '12px',
+    lineHeight: '20px',
+    color: cssVar.colorTextTertiary,
+  },
+  attachments: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  },
+  footer: {
+    display: 'flex',
+    flex: 'none',
+    flexDirection: 'column',
+    gap: '8px',
+    marginInline: '-12px',
+    paddingBlockStart: '12px',
+    paddingBlockEnd: '4px',
+    paddingInline: '16px',
+    borderBlockStartWidth: '1px',
+    borderBlockStartStyle: 'solid',
+    borderBlockStartColor: cssVar.colorBorderSecondary,
+  },
+  footerButton: {
+    width: '100%',
+    minHeight: '44px',
+  },
+  alert: {
+    fontSize: '12px',
+    lineHeight: '20px',
+  },
+});
 
-    min-height: 0;
-    padding-block-end: 12px;
-  `,
-  /** The image keeps a fixed slice of the screen so the notes under it are
-      reachable without a second screen — but stays tall enough to circle on. */
-  stage: css`
-    display: flex;
-    flex: none;
-    height: 42dvh;
-    min-height: 220px;
-  `,
-  editor: css`
-    display: flex;
-    flex: none;
-    flex-direction: column;
-    gap: 16px;
-
-    padding-block-start: 4px;
-
-    textarea {
-      font-size: 16px;
-    }
-  `,
-  footer: css`
-    display: flex;
-    flex: none;
-    flex-direction: column;
-    gap: 8px;
-
-    padding-block-start: 8px;
-    border-block-start: 1px solid ${cssVar.colorBorderSecondary};
-
-    > button {
-      min-height: 44px;
-    }
-  `,
-}));
-
-/**
- * Phone review on one page: look at the image, circle what is wrong, and write
- * the note right where the circle landed.
- */
 export const MobileEvidenceReview = memo<{ model: RejectReviewModel }>(({ model }) => {
   const { t } = useTranslation('verify');
   const {
     activeAnnotations,
     activeEvidence,
     activeIndex,
-    annotations,
+    // Videos' notes stay in the model and are submitted untouched; the phone
+    // has no stage to point them back to, so it lists only what it can edit.
+    editableAnnotations: annotations,
     attachments,
     canSubmit,
     canvas,
@@ -93,35 +168,38 @@ export const MobileEvidenceReview = memo<{ model: RejectReviewModel }>(({ model 
     zoom,
   } = model;
 
+  const hasRegions = annotations.length > 0;
+  const toggleDraw = () => model.advance('toggle-draw');
+
+  const regionSection = (
+    <div {...stylex.props(styles.section)}>
+      <div {...stylex.props(styles.sectionTitle)}>{t('acceptance.review.regionComments')}</div>
+      {hasRegions ? (
+        <div {...stylex.props(styles.regionList)}>
+          <MobileRegionNotes
+            annotations={annotations}
+            evidence={evidence}
+            onChange={model.editAnnotation}
+            onJump={model.jumpToRegion}
+            onRemove={model.removeAnnotation}
+          />
+        </div>
+      ) : (
+        <div {...stylex.props(styles.regionEmpty)}>
+          {t('acceptance.review.mobileRegionCommentsEmpty')}
+        </div>
+      )}
+    </div>
+  );
+
   return (
-    <div className={styles.body}>
-      <div className={styles.scroll}>
+    <div {...stylex.props(styles.body)}>
+      <div {...stylex.props(styles.scroll)}>
         {activeEvidence && (
           <>
-            <Flexbox horizontal align={'center'} gap={8} style={{ flex: 'none' }}>
-              <ActionIcon
-                aria-label={t('acceptance.review.previousImage')}
-                disabled={activeIndex <= 0}
-                icon={ChevronLeft}
-                size={{ blockSize: 44, size: 20 }}
-                onClick={() => model.selectEvidence(activeIndex - 1)}
-              />
-              <Text aria-live={'polite'} style={{ flex: 1, textAlign: 'center' }}>
-                {t('acceptance.review.imageNumber', {
-                  current: activeIndex + 1,
-                  total: evidence.length,
-                })}
-              </Text>
-              <ActionIcon
-                aria-label={t('acceptance.review.nextImage')}
-                disabled={activeIndex >= evidence.length - 1}
-                icon={ChevronRight}
-                size={{ blockSize: 44, size: 20 }}
-                onClick={() => model.selectEvidence(activeIndex + 1)}
-              />
-            </Flexbox>
-            <div className={styles.stage}>
+            <div {...stylex.props(styles.stage)}>
               <EvidenceStage
+                contain
                 touch
                 annotations={activeAnnotations}
                 drawing={drawing}
@@ -131,102 +209,114 @@ export const MobileEvidenceReview = memo<{ model: RejectReviewModel }>(({ model 
                 onRemove={canvas.onRemove}
                 onSwipe={(direction) => model.selectEvidence(activeIndex + direction)}
                 onUpdate={canvas.onUpdate}
+                onZoom={model.setZoom}
               />
             </div>
-            <Flexbox horizontal align={'center'} gap={8} style={{ flex: 'none' }}>
-              {/* A mode switch, not an action button. A single button labelled
-                  with the mode it would LEAVE says nothing about which mode is
-                  on, and its 44px slab sat oddly beside the small zoom icons. */}
-              <Segmented
-                size={'small'}
-                value={drawing ? 'draw' : 'browse'}
-                options={[
-                  { label: t('acceptance.review.browseImage'), value: 'browse' },
-                  { label: t('acceptance.review.drawRegion'), value: 'draw' },
-                ]}
-                onChange={(value) => {
-                  if ((value === 'draw') !== drawing) model.advance('toggle-draw');
-                }}
+            <div {...stylex.props(styles.switcher)}>
+              <ActionIcon
+                aria-label={t('acceptance.review.previousImage')}
+                disabled={activeIndex <= 0}
+                icon={ChevronLeft}
+                size={TOUCH_ICON}
+                onClick={() => model.selectEvidence(activeIndex - 1)}
               />
-              <Flexbox flex={1} />
+              <span
+                {...stylex.props(styles.counter)}
+                aria-label={t('acceptance.review.imageNumber', {
+                  current: activeIndex + 1,
+                  total: evidence.length,
+                })}
+              >
+                {activeIndex + 1} / {evidence.length}
+              </span>
+              <ActionIcon
+                aria-label={t('acceptance.review.nextImage')}
+                disabled={activeIndex >= evidence.length - 1}
+                icon={ChevronRight}
+                size={TOUCH_ICON}
+                onClick={() => model.selectEvidence(activeIndex + 1)}
+              />
+              <span {...stylex.props(styles.spacer)} />
               <ActionIcon
                 aria-label={t('acceptance.review.zoomOut')}
                 disabled={zoom <= ZOOM_STEPS[0]}
                 icon={ZoomOut}
-                size={{ blockSize: 44, size: 20 }}
+                size={TOUCH_ICON}
                 onClick={() => model.stepZoom(-1)}
               />
-              <Text fontSize={12}>{Math.round(zoom * 100)}%</Text>
+              <span aria-live={'polite'} {...stylex.props(styles.zoomValue)}>
+                {Math.round(zoom * 100)}%
+              </span>
               <ActionIcon
                 aria-label={t('acceptance.review.zoomIn')}
                 disabled={zoom >= ZOOM_STEPS.at(-1)!}
                 icon={ZoomIn}
-                size={{ blockSize: 44, size: 20 }}
+                size={TOUCH_ICON}
                 onClick={() => model.stepZoom(1)}
               />
-            </Flexbox>
-            {/* The hint is the region's receipt: it says the box landed AND
-                that it is still editable, right above the note it belongs to. */}
-            <Text fontSize={12} style={{ flex: 'none' }} type={'secondary'}>
-              {drawing && activeAnnotations.length > 0
-                ? t('acceptance.review.mobileDrawnHint', { count: activeAnnotations.length })
-                : t(
-                    drawing
-                      ? 'acceptance.review.mobileDrawHint'
-                      : 'acceptance.review.mobileBrowseHint',
-                  )}
-            </Text>
+            </div>
           </>
         )}
-        <div className={styles.editor}>
-          {annotations.length > 0 && (
-            <>
-              <Text strong>{t('acceptance.review.regionComments')}</Text>
-              <MobileRegionNotes
-                annotations={annotations}
-                evidence={evidence}
-                onChange={model.editAnnotation}
-                onJump={model.jumpToRegion}
-                onRemove={model.removeAnnotation}
+        {drawing ? (
+          regionSection
+        ) : (
+          <>
+            {activeEvidence && (
+              <Button icon={PencilLine} {...stylex.props(styles.drawButton)} onClick={toggleDraw}>
+                {t('acceptance.review.drawRegion')}
+              </Button>
+            )}
+            {hasRegions && regionSection}
+            <div {...stylex.props(styles.section)}>
+              <div {...stylex.props(styles.label)}>{t('acceptance.review.supplement')}</div>
+              {/* 16px: iOS Safari zooms the page when a focused field is smaller. */}
+              <TextArea
+                aria-label={t('acceptance.review.supplement')}
+                autoSize={{ maxRows: 10, minRows: 3 }}
+                placeholder={t('acceptance.review.rejectPlaceholder')}
+                style={{ fontSize: 16 }}
+                value={comment}
+                variant={'filled'}
+                onChange={(event) => model.setComment(event.target.value)}
+                onPaste={handlePaste}
               />
-            </>
-          )}
-          <Text strong>{t('acceptance.review.supplement')}</Text>
-          <TextArea
-            aria-label={t('acceptance.review.supplement')}
-            autoSize={{ maxRows: 10, minRows: 4 }}
-            placeholder={t('acceptance.review.rejectPlaceholder')}
-            style={{ fontSize: 16 }}
-            value={comment}
-            onChange={(event) => model.setComment(event.target.value)}
-            onPaste={handlePaste}
-          />
-          <AttachmentUploadButton disabled={loading} onFiles={model.uploadFiles} />
-          <AttachmentStrip
-            attachments={attachments}
-            disabled={loading}
-            uploading={uploading}
-            onRemove={model.removeAttachment}
-          />
-          <Text fontSize={12} type={'secondary'}>
-            {t('acceptance.review.draftSaved')}
-          </Text>
-        </div>
-      </div>
-      <div className={styles.footer}>
-        {failed && (
-          <Text role={'alert'} type={'danger'}>
-            {t('acceptance.review.submitFailed')}
-          </Text>
+              <div {...stylex.props(styles.caption)}>{t('acceptance.review.draftSaved')}</div>
+              <div {...stylex.props(styles.attachments)}>
+                <AttachmentUploadButton disabled={loading} onFiles={model.uploadFiles} />
+                <AttachmentStrip
+                  attachments={attachments}
+                  disabled={loading}
+                  uploading={uploading}
+                  onRemove={model.removeAttachment}
+                />
+              </div>
+            </div>
+          </>
         )}
-        <Button
-          disabled={!canSubmit}
-          loading={loading}
-          type={'primary'}
-          onClick={model.submitReject}
-        >
-          {t('acceptance.review.confirmReject')}
-        </Button>
+      </div>
+      <div {...stylex.props(styles.footer)}>
+        {drawing ? (
+          <Button type={'primary'} {...stylex.props(styles.footerButton)} onClick={toggleDraw}>
+            {t('acceptance.review.confirmRegions')}
+          </Button>
+        ) : (
+          <>
+            {failed && (
+              <Text role={'alert'} type={'danger'} {...stylex.props(styles.alert)}>
+                {t('acceptance.review.submitFailed')}
+              </Text>
+            )}
+            <Button
+              disabled={!canSubmit}
+              loading={loading}
+              type={'primary'}
+              {...stylex.props(styles.footerButton)}
+              onClick={model.submitReject}
+            >
+              {t('acceptance.review.confirmReject')}
+            </Button>
+          </>
+        )}
       </div>
     </div>
   );

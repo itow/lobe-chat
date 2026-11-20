@@ -1,25 +1,23 @@
-import type { CompletionSoundSettings } from '@lobechat/electron-client-ipc';
-import { Flexbox, Form } from '@lobehub/ui';
 import {
-  ActionIcon,
-  Alert,
-  Button,
-  Segmented,
-  Skeleton,
-  Slider,
-  Switch,
-  Text,
-} from '@lobehub/ui/base-ui';
+  COMPLETION_BUILTIN_SOUNDS,
+  type CompletionSoundSettings,
+} from '@lobechat/electron-client-ipc';
+import { Alert, Button, Flexbox, Segmented, Select, Slider, Switch } from '@lobehub/ui';
+import { Form, useForm } from '@lobehub/ui/form';
 import { Play } from 'lucide-react';
 import { useCallback, useEffect, useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import BusinessNotification from '@/business/client/BusinessSettingPages/Notification';
+import { SettingsSectionSkeleton } from '@/components/Skeleton';
 import { FORM_STYLE } from '@/const/layoutTokens';
 import { SettingsSearchAnchor } from '@/features/SettingsSearch/anchor';
 import { completionSoundService } from '@/services/electron/completionSound';
 import { desktopNotificationService } from '@/services/electron/desktopNotification';
 import { serverConfigSelectors, useServerConfigStore } from '@/store/serverConfig';
+
+const IMPORTED = 'imported';
+const IMPORT = 'import';
 
 export const DesktopNotificationSettings = () => {
   const { t } = useTranslation('setting');
@@ -28,6 +26,7 @@ export const DesktopNotificationSettings = () => {
   const [settings, setSettings] = useState<CompletionSoundSettings>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(false);
+  const form = useForm();
 
   const report = useCallback(async (action: () => Promise<CompletionSoundSettings | void>) => {
     setError(false);
@@ -82,10 +81,19 @@ export const DesktopNotificationSettings = () => {
         />
       )}
       {!settings ? (
-        !error && <Skeleton.Text rows={3} />
+        !error && (
+          // Completion sound (toggle/sound/volume) and banner sound groups.
+          <SettingsSectionSkeleton
+            groups={[
+              { rows: 3, titleWidth: 136 },
+              { rows: 1, titleWidth: 112 },
+            ]}
+          />
+        )
       ) : (
         <Form
           collapsible={false}
+          form={form}
           itemMinWidth={FORM_STYLE.itemMinWidth}
           itemsType={'group'}
           style={FORM_STYLE.style}
@@ -95,19 +103,17 @@ export const DesktopNotificationSettings = () => {
               children: [
                 {
                   children: (
-                    <Flexbox horizontal justify={'flex-end'}>
-                      <Switch
-                        checked={settings.enabled}
-                        disabled={busy}
-                        id={soundToggleId}
-                        onChange={(enabled) =>
-                          run(() => completionSoundService.setSettings({ enabled }))
-                        }
-                      />
-                    </Flexbox>
+                    <Switch
+                      checked={settings.enabled}
+                      disabled={busy}
+                      id={soundToggleId}
+                      style={{ alignSelf: 'flex-end' }}
+                      onChange={(enabled) =>
+                        run(() => completionSoundService.setSettings({ enabled }))
+                      }
+                    />
                   ),
                   desc: t('completionSound.desc'),
-                  htmlFor: soundToggleId,
                   label: (
                     <SettingsSearchAnchor id={'notification-completion-sound'}>
                       {t('completionSound.enabled')}
@@ -117,35 +123,29 @@ export const DesktopNotificationSettings = () => {
                 {
                   children: (
                     <Flexbox horizontal align={'center'} gap={8} justify={'flex-end'}>
-                      <Text ellipsis type={'secondary'}>
-                        {settings.name ?? t('completionSound.default')}
-                      </Text>
-                      <ActionIcon
+                      <Select
+                        disabled={busy}
+                        value={settings.name ? IMPORTED : settings.builtin}
+                        options={[
+                          ...(settings.name ? [{ label: settings.name, value: IMPORTED }] : []),
+                          ...COMPLETION_BUILTIN_SOUNDS.map((value) => ({
+                            label: t(`completionSound.builtin.${value}`),
+                            value,
+                          })),
+                          { label: t('completionSound.import'), value: IMPORT },
+                        ]}
+                        onChange={(value) => {
+                          if (value === IMPORT) return run(completionSoundService.importSound);
+                          const builtin = COMPLETION_BUILTIN_SOUNDS.find((id) => id === value);
+                          if (builtin) run(() => completionSoundService.setSettings({ builtin }));
+                        }}
+                      />
+                      <Button
                         disabled={settings.volume === 0}
                         icon={Play}
-                        size={'small'}
                         title={t('completionSound.preview')}
                         onClick={() => report(() => completionSoundService.play({ preview: true }))}
                       />
-                      <Button
-                        disabled={busy}
-                        size={'small'}
-                        onClick={() => run(completionSoundService.importSound)}
-                      >
-                        {t('completionSound.import')}
-                      </Button>
-                      {settings.name && (
-                        <Button
-                          disabled={busy}
-                          size={'small'}
-                          type={'text'}
-                          onClick={() =>
-                            run(() => completionSoundService.setSettings({ reset: true }))
-                          }
-                        >
-                          {t('completionSound.reset')}
-                        </Button>
-                      )}
                     </Flexbox>
                   ),
                   desc: t('completionSound.importHint'),
@@ -177,15 +177,13 @@ export const DesktopNotificationSettings = () => {
                 {
                   children: (
                     <Flexbox horizontal align={'center'} gap={8} justify={'flex-end'}>
-                      <ActionIcon
+                      <Button
                         icon={Play}
-                        size={'small'}
                         title={t('completionSound.preview')}
                         onClick={previewBanner}
                       />
                       <Segmented<CompletionSoundSettings['notificationSound']>
                         disabled={busy}
-                        size={'small'}
                         value={settings.notificationSound}
                         options={[
                           { label: t('completionSound.banner.system'), value: 'system' },

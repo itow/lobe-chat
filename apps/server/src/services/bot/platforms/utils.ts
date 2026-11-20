@@ -1,5 +1,5 @@
 import { DEFAULT_BOT_DEBOUNCE_MS } from '@lobechat/const';
-import { merge } from '@lobechat/utils';
+import { formatDuration as formatDurationMs, merge } from '@lobechat/utils';
 
 import type {
   BotProviderConfig,
@@ -161,6 +161,37 @@ export function getEffectiveConnectionMode(
   return platform?.connectionMode ?? 'webhook';
 }
 
+/**
+ * The definition as a deployment that can only run it in webhook mode should
+ * present it: webhook is the default and the only connection mode offered, so
+ * nobody is steered to a mode that is refused when they connect.
+ */
+export function restrictPlatformToWebhook<
+  T extends { connectionMode: ConnectionMode; schema: FieldSchema[] },
+>(platform: T): T {
+  const restrictField = (field: FieldSchema): FieldSchema => {
+    if (field.key !== 'connectionMode') return field;
+    const keep = (field.enum ?? []).map((mode) => mode === 'webhook');
+    return {
+      ...field,
+      default: 'webhook',
+      enum: field.enum?.filter((_, index) => keep[index]),
+      enumDescriptions: field.enumDescriptions?.filter((_, index) => keep[index]),
+      enumLabels: field.enumLabels?.filter((_, index) => keep[index]),
+    };
+  };
+
+  return {
+    ...platform,
+    connectionMode: 'webhook',
+    schema: platform.schema.map((field) =>
+      field.key === 'settings' && field.properties
+        ? { ...field, properties: field.properties.map(restrictField) }
+        : field,
+    ),
+  };
+}
+
 // --------------- Provider config resolution ---------------
 
 /**
@@ -259,12 +290,7 @@ export function formatTokens(tokens: number): string {
 }
 
 export function formatDuration(ms: number): string {
-  const totalSeconds = Math.floor(ms / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-
-  if (minutes > 0) return `${minutes}m${seconds}s`;
-  return `${seconds}s`;
+  return formatDurationMs(ms);
 }
 
 /**

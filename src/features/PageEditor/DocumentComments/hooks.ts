@@ -1,68 +1,51 @@
-import type {
-  DocumentCommentDetail,
-  DocumentCommentItem,
-  DocumentCommentReplyPage,
-  DocumentCommentSummary,
-  DocumentCommentThreadPage,
-} from '@lobechat/types';
-import { useCallback } from 'react';
-import useSWRInfinite from 'swr/infinite';
+import type { DocumentCommentItem, DocumentCommentSelectionAnchor } from '@lobechat/types';
+import { useCallback, useEffect, useMemo } from 'react';
 
 import { useActiveWorkspaceId } from '@/business/client/hooks/useActiveWorkspaceId';
-import { useClientDataSWR } from '@/libs/swr';
-import { documentCommentKeys } from '@/libs/swr/keys';
-import { documentCommentService } from '@/services/documentComment';
+import type { ReplicaPagedData } from '@/libs/replica';
+import {
+  documentCommentActions,
+  documentCommentSelectors,
+  type DocumentCommentThreadScope,
+  useDocumentCommentStore,
+} from '@/store/documentComment';
 import { useUserStore } from '@/store/user';
 import { userProfileSelectors } from '@/store/user/selectors';
 import { isTrpcErrorCode } from '@/utils/trpcError';
 
 import {
   createOptimisticComment,
+  type DocumentCommentUpdateHandler,
   flattenDocumentCommentReplies,
   flattenDocumentCommentThreads,
 } from './optimistic';
 
-const PAGE_SIZE = 20;
+export type { DocumentCommentThreadScope } from '@/store/documentComment';
 
-const fetchThreads = ([, , documentId, cursor]: readonly string[]) =>
-  documentCommentService.listThreads({
-    cursor: cursor || undefined,
-    documentId,
-    limit: PAGE_SIZE,
-  });
-
-const fetchReplies = ([, , rootCommentId, cursor]: readonly string[]) =>
-  documentCommentService.listReplies({
-    cursor: cursor || undefined,
-    limit: PAGE_SIZE,
-    rootCommentId,
-  });
-
-const getPaginationState = <T extends { nextCursor: string | null }>(
-  data: T[] | undefined,
-  error: unknown,
-  isLoading: boolean,
-  isValidating: boolean,
-  size: number,
+/**
+ * Paging flags of a replica feed. The feed entry is the data: `undefined`
+ * means nothing has painted yet (neither the persisted copy nor the network),
+ * which is the only state that shows a loading placeholder.
+ */
+export const getFeedPaginationState = (
+  feed: ReplicaPagedData<unknown, string> | undefined,
+  { enabled, error, isValidating }: { enabled: boolean; error: unknown; isValidating: boolean },
 ) => {
-  const hasLoadedPages = data !== undefined;
-  const lastPage = data?.findLast(Boolean);
-
+  const hasError = Boolean(error);
   return {
-    hasMore: !error && Boolean(lastPage?.nextCursor),
-    isInitialError: Boolean(error) && !hasLoadedPages,
-    isLoadingInitial: !error && isLoading && !hasLoadedPages,
-    isLoadingMore: !error && hasLoadedPages && size > 0 && typeof data?.[size - 1] === 'undefined',
-    isRetrying: Boolean(error) && isValidating,
+    hasMore: !hasError && Boolean(feed?.hasMore),
+    isInitialError: hasError && !feed,
+    isLoadingInitial: enabled && !hasError && !feed,
+    isLoadingMore: !hasError && Boolean(feed?.isLoadingMore),
+    isRetrying: hasError && isValidating,
   };
 };
 
-export const useDocumentCommentSummary = (documentId?: string | null) =>
-  useClientDataSWR<DocumentCommentSummary>(
-    documentId ? documentCommentKeys.summary(documentId) : null,
-    () => documentCommentService.summary(documentId!),
-    { dedupingInterval: 30_000 },
-  );
+export const useDocumentCommentSummary = (documentId?: string | null) => {
+  const sync = documentCommentActions.useFetchSummary(documentId);
+  const data = useDocumentCommentStore(documentCommentSelectors.summary(documentId));
+  return { data, error: sync.error, isLoading: Boolean(documentId) && !data && !sync.error };
+};
 
 /**
  * One comment by id. Lists are oldest-first and a notification usually points
@@ -71,12 +54,21 @@ export const useDocumentCommentSummary = (documentId?: string | null) =>
  */
 export const useDocumentCommentDetail = (commentId?: string | null) => {
   const workspaceId = useActiveWorkspaceId();
-  const response = useClientDataSWR<DocumentCommentDetail>(
-    commentId && workspaceId ? documentCommentKeys.detail(workspaceId, commentId) : null,
-    () => documentCommentService.get(commentId!),
-  );
+  const enabledId = workspaceId ? commentId : undefined;
+  const sync = documentCommentActions.useFetchDetail(enabledId);
+  const data = useDocumentCommentStore(documentCommentSelectors.detail(enabledId));
 
-  return { ...response, isNotFound: isTrpcErrorCode(response.error, 'NOT_FOUND') };
+  return {
+    data,
+    error: sync.error,
+    isNotFound: isTrpcErrorCode(sync.error, 'NOT_FOUND'),
+    revalidate: sync.revalidate,
+  };
+};
+
+/** Edits go through the store, which patches every painted copy of the comment. */
+export const handleDocumentCommentUpdate: DocumentCommentUpdateHandler = async (comment, value) => {
+  await documentCommentActions.updateComment(comment, value);
 };
 
 export const useOptimisticDocumentComment = () => {
@@ -91,6 +83,7 @@ export const useOptimisticDocumentComment = () => {
       editorData,
       parentCommentId,
       replyTo,
+      selectionAnchor,
     }: {
       clientId: string;
       content: string;
@@ -98,6 +91,7 @@ export const useOptimisticDocumentComment = () => {
       editorData: DocumentCommentItem['editorData'];
       parentCommentId?: string;
       replyTo?: DocumentCommentItem['replyTo'];
+      selectionAnchor?: DocumentCommentSelectionAnchor;
     }) => {
       if (!workspaceId) throw new Error('Workspace is required for document comments');
 
@@ -115,6 +109,7 @@ export const useOptimisticDocumentComment = () => {
         editorData,
         parentCommentId,
         replyTo,
+        selectionAnchor,
         userId: user?.id ?? null,
         workspaceId,
       });
@@ -123,35 +118,96 @@ export const useOptimisticDocumentComment = () => {
   );
 };
 
-export const useDocumentCommentThreads = (documentId?: string | null) => {
+/**
+ * Every anchored root of the document, independent of how many thread pages
+ * the list has loaded. Body highlights are painted from this so a
+ * newer anchored comment is discoverable from the document right after a
+ * reload, not only once the reader has paged the list far enough to reach it.
+ */
+export const useDocumentCommentAnchorList = (documentId?: string | null) => {
   const workspaceId = useActiveWorkspaceId();
-  const getKey = useCallback(
-    (_index: number, previous: DocumentCommentThreadPage | null) => {
-      if (!documentId || !workspaceId || previous?.nextCursor === null) return null;
-      return documentCommentKeys.threads(
-        workspaceId,
-        documentId,
-        previous?.nextCursor ?? undefined,
-      );
-    },
-    [documentId, workspaceId],
+  const enabledId = workspaceId ? documentId : undefined;
+  documentCommentActions.useFetchAnchors(enabledId);
+  return useDocumentCommentStore(documentCommentSelectors.anchorList(enabledId));
+};
+
+/**
+ * How many pages of anchored threads the gutter fetches ahead of demand while
+ * it is open, so the cards beside the text are there for the runs a reader
+ * is most likely looking at. Anything past it stays paginated: a highlight
+ * whose thread is not loaded is still painted (from the anchor list) and
+ * fetches its own thread on pick, and the list below the body pages the rest.
+ */
+export const ANCHORED_EAGER_PAGE_LIMIT = 4;
+
+/** Whether the eager drain should ask for the next page now. */
+export const shouldLoadEagerPage = (
+  feed: ReplicaPagedData<unknown, string> | undefined,
+  limit: number,
+) =>
+  Boolean(feed) &&
+  feed!.hasMore &&
+  !feed!.isLoadingMore &&
+  // A failed page stops the drain; the reader retries it explicitly.
+  !feed!.loadMoreError &&
+  feed!.currentPage + 1 < limit;
+
+export const useDocumentCommentThreads = (
+  documentId?: string | null,
+  scope: DocumentCommentThreadScope = 'all',
+  {
+    eagerPageLimit = 0,
+  }: {
+    /**
+     * Pages to fetch ahead of demand, one after another, without the reader
+     * asking; `0` (the default) leaves paging entirely to `loadMore`.
+     */
+    eagerPageLimit?: number;
+  } = {},
+) => {
+  const workspaceId = useActiveWorkspaceId();
+  const params = useMemo(
+    () => (documentId && workspaceId ? { documentId, scope } : null),
+    [documentId, scope, workspaceId],
   );
-  const response = useSWRInfinite<DocumentCommentThreadPage>(getKey, fetchThreads, {
-    revalidateFirstPage: false,
+  const sync = documentCommentActions.useFetchThreads(params);
+  const feed = useDocumentCommentStore(documentCommentSelectors.threadFeed(params));
+  // A head refresh failure, or a failed "load more" page.
+  const error = (sync.error ?? feed?.loadMoreError) as Error | undefined;
+  const pagination = getFeedPaginationState(feed, {
+    enabled: Boolean(params),
+    error,
+    isValidating: sync.isValidating,
   });
 
+  // Fetch ahead of demand up to the caller's budget: for the gutter, a card
+  // it has not loaded is a highlight with nothing beside it. The budget keeps
+  // a document with hundreds of anchored roots from mounting every one of
+  // them (twice — gutter and list) before the reader has looked at any. A
+  // feed painted from storage does not page until the network confirms its
+  // head (its cursor may be stale); the confirmed head re-runs this.
+  useEffect(() => {
+    if (!params || !shouldLoadEagerPage(feed, eagerPageLimit)) return;
+    void documentCommentActions.loadMoreThreads(params);
+  }, [eagerPageLimit, feed, params]);
+
+  const items = useMemo(() => flattenDocumentCommentThreads(feed?.items), [feed?.items]);
+  const loadMore = useCallback(
+    () => (params ? documentCommentActions.loadMoreThreads(params) : Promise.resolve()),
+    [params],
+  );
+  const reload = useCallback(
+    () => (params ? documentCommentActions.revalidateThreads(params) : Promise.resolve()),
+    [params],
+  );
+
   return {
-    ...response,
-    ...getPaginationState(
-      response.data,
-      response.error,
-      response.isLoading,
-      response.isValidating,
-      response.size,
-    ),
-    items: flattenDocumentCommentThreads(response.data),
-    loadMore: () => response.setSize((current) => current + 1),
-    reload: () => response.mutate(),
+    ...pagination,
+    error,
+    isValidating: sync.isValidating,
+    items,
+    loadMore,
+    reload,
   };
 };
 
@@ -160,32 +216,34 @@ export const useDocumentCommentReplies = (
   enabled: boolean,
 ) => {
   const workspaceId = useActiveWorkspaceId();
-  const getKey = useCallback(
-    (_index: number, previous: DocumentCommentReplyPage | null) => {
-      if (!enabled || !rootCommentId || !workspaceId || previous?.nextCursor === null) return null;
-      return documentCommentKeys.replies(
-        workspaceId,
-        rootCommentId,
-        previous?.nextCursor ?? undefined,
-      );
-    },
-    [enabled, rootCommentId, workspaceId],
+  const enabledId = workspaceId ? rootCommentId : undefined;
+  const sync = documentCommentActions.useFetchReplies(enabledId, enabled);
+  const feed = useDocumentCommentStore(
+    documentCommentSelectors.replyFeed(enabled ? enabledId : undefined),
   );
-  const response = useSWRInfinite<DocumentCommentReplyPage>(getKey, fetchReplies, {
-    revalidateFirstPage: false,
-  });
+  // A head refresh failure, or a failed "load more" page.
+  const error = (sync.error ?? feed?.loadMoreError) as Error | undefined;
+
+  const items = useMemo(() => flattenDocumentCommentReplies(feed?.items), [feed?.items]);
+  const loadMore = useCallback(
+    () => (enabledId ? documentCommentActions.loadMoreReplies(enabledId) : Promise.resolve()),
+    [enabledId],
+  );
+  const reload = useCallback(
+    () => (enabledId ? documentCommentActions.revalidateReplies(enabledId) : Promise.resolve()),
+    [enabledId],
+  );
 
   return {
-    ...response,
-    ...getPaginationState(
-      response.data,
-      response.error,
-      response.isLoading,
-      response.isValidating,
-      response.size,
-    ),
-    items: flattenDocumentCommentReplies(response.data),
-    loadMore: () => response.setSize((current) => current + 1),
-    reload: () => response.mutate(),
+    error,
+    isValidating: sync.isValidating,
+    ...getFeedPaginationState(feed, {
+      enabled: enabled && Boolean(enabledId),
+      error,
+      isValidating: sync.isValidating,
+    }),
+    items,
+    loadMore,
+    reload,
   };
 };

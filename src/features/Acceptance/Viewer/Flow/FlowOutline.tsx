@@ -1,7 +1,7 @@
-import { Flexbox, Icon } from '@lobehub/ui';
-import { Button, Text } from '@lobehub/ui/base-ui';
+import { Button, Flexbox, Icon, Text } from '@lobehub/ui';
+import { cssVar } from '@lobehub/ui/stylex/cssVar.stylex';
+import * as stylex from '@stylexjs/stylex';
 import type { Edge, Node } from '@xyflow/react';
-import { createStaticStyles, cssVar } from 'antd-style';
 import {
   ArrowRight,
   CheckCircle2,
@@ -20,36 +20,38 @@ import type { FlowGraphData } from './flowGraph';
 import { flowStateColor } from './FlowNode';
 import { buildOutlineTree, type OutlineBranch, type OutlineStep } from './flowOutlineTree';
 
-const styles = createStaticStyles(({ css }) => ({
-  item: css`
-    width: 100%;
-    height: auto;
-    min-height: 36px;
-    padding-block: 6px;
-    padding-inline: 12px;
-
-    text-align: start;
-    white-space: normal;
-  `,
-  branch: css`
-    justify-content: flex-start;
-
-    width: 100%;
-    height: auto;
-    min-height: 32px;
-    padding-block: 4px;
-    padding-inline: 12px;
-
-    color: ${cssVar.colorTextSecondary};
-    text-align: start;
-    white-space: normal;
-  `,
-  nested: css`
-    margin-inline-start: 18px;
-    padding-inline-start: 8px;
-    border-inline-start: 1px solid ${cssVar.colorBorderSecondary};
-  `,
-}));
+const styles = stylex.create({
+  item: {
+    width: '100%',
+    height: 'auto',
+    minHeight: '36px',
+    paddingBlock: '6px',
+    paddingInline: '12px',
+    textAlign: 'start',
+    whiteSpace: 'normal',
+  },
+  branch: {
+    justifyContent: 'flex-start',
+    width: 'fit-content',
+    maxWidth: '100%',
+    height: 'auto',
+    minHeight: '24px',
+    paddingBlock: '2px',
+    paddingInline: '12px',
+    fontSize: '12px',
+    lineHeight: '18px',
+    textAlign: 'start',
+    whiteSpace: 'normal',
+  },
+  branchContent: { color: cssVar.colorTextTertiary },
+  nested: {
+    marginInlineStart: '18px',
+    paddingInlineStart: '8px',
+    borderInlineStartWidth: '1px',
+    borderInlineStartStyle: 'solid',
+    borderInlineStartColor: cssVar.colorBorderSecondary,
+  },
+});
 
 /** A readable traversal of the same graph: dependent steps are indented under the branch that leads to them. */
 export function FlowOutline({
@@ -80,7 +82,7 @@ export function FlowOutline({
     return (
       <Button
         aria-expanded={group ? !data.collapsed : undefined}
-        className={styles.item}
+        className={stylex.props(styles.item).className}
         type={data.selected ? 'default' : 'text'}
         onClick={() => (group ? data.onToggle?.() : onSelect(node.id))}
       >
@@ -112,16 +114,23 @@ export function FlowOutline({
     if (!reference && (!label || label === branch.target.data.title)) return null;
     return (
       <Button
-        className={styles.branch}
+        className={stylex.props(styles.branch).className}
         key={branch.edge.id}
         type="text"
         onClick={() => onSelect(branch.edge.id)}
       >
-        <Flexbox horizontal align="center" gap={8}>
+        {/* Top-aligned: a caption that wraps keeps its glyph on the first line and
+            its later lines under the text, not under the glyph. */}
+        <Flexbox
+          horizontal
+          align="flex-start"
+          className={stylex.props(styles.branchContent).className}
+          gap={6}
+        >
           <Icon
             icon={reference ? ArrowRight : CornerDownRight}
-            size={14}
-            style={{ flex: 'none' }}
+            size={12}
+            style={{ flex: 'none', marginBlockStart: 3 }}
           />
           <span>{reference ? `${label} → ${branch.target.data.title}` : label}</span>
         </Flexbox>
@@ -134,7 +143,7 @@ export function FlowOutline({
       <Flexbox gap={2} key={step.node.id}>
         {renderItem(step.node)}
         {step.node.type === 'flowGroup' && !step.node.data.collapsed && (
-          <Flexbox className={styles.nested} gap={2}>
+          <Flexbox className={stylex.props(styles.nested).className} gap={2}>
             {step.members.flatMap(renderSequence)}
           </Flexbox>
         )}
@@ -153,7 +162,7 @@ export function FlowOutline({
         out.push(
           <Flexbox gap={2} key={`branch:${branch.edge.id}`}>
             {label}
-            <Flexbox className={styles.nested} gap={2}>
+            <Flexbox className={stylex.props(styles.nested).className} gap={2}>
               {steps}
             </Flexbox>
           </Flexbox>,

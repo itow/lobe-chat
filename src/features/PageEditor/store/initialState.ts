@@ -1,9 +1,16 @@
+import type { DocumentCommentSelectionAnchor } from '@lobechat/types';
 import { type IEditor } from '@lobehub/editor';
 
 import { type EditLockHealth } from '@/features/EditLock';
 
 export type MetaSaveStatus = 'idle' | 'saving' | 'saved';
 export type RightPanelMode = 'copilot' | 'history';
+
+/** A captured body selection, tagged with the document it was taken from. */
+export interface PendingCommentAnchor {
+  anchor: DocumentCommentSelectionAnchor;
+  documentId: string;
+}
 
 export interface PublicState {
   autoSave?: boolean;
@@ -18,6 +25,7 @@ export interface PublicState {
    */
   metaReadOnly?: boolean;
   onBack?: () => void;
+  onCollabReset?: () => void;
   onDelete?: () => void;
   onDocumentIdChange?: (newId: string) => void;
   onEmojiChange?: (emoji: string | undefined) => void;
@@ -27,7 +35,30 @@ export interface PublicState {
   title?: string;
 }
 
+export interface PageCollabState {
+  access: 'edit' | 'view';
+  blocked?: 'deleted' | 'too_large';
+  /** The room's body reached the editor; until then the page shows the stored copy. */
+  bodyReady?: boolean;
+  capacity?: 'full' | 'near_full' | 'ok';
+  /** This member edited the page in the room; from then on the room holds the page's edit lock. */
+  edited?: boolean;
+  pending: number;
+  /** Joins the room again after it failed to sync. */
+  retry?: () => void;
+  status: 'connecting' | 'error' | 'offline' | 'synced';
+}
+
 export interface State extends PublicState {
+  /** Present while the body is edited through a live collaboration room. */
+  collab?: PageCollabState;
+  /**
+   * Whether the comments panel beside the body is open. It is its own panel,
+   * not a mode of the page-agent panel, so opening it never displaces the
+   * copilot and vice versa. Not persisted: a fresh document starts closed
+   * and a selection opens it on demand.
+   */
+  commentsPanelOpen: boolean;
   documentId: string | undefined;
   editor?: IEditor;
   /** True until the first lock peek resolves; the editor stays read-only until then. */
@@ -61,11 +92,31 @@ export interface State extends PublicState {
   /** Edit-session id for this open page instance. */
   lockOwnerId?: string;
   metaSaveStatus?: MetaSaveStatus;
+  /**
+   * A body selection captured by the toolbar's comment action and waiting for
+   * the composer to publish it. This is the one piece of state the editor
+   * canvas and the comment list have to share — everything else about an
+   * anchor is derived from the body's DOM inside the comment list.
+   *
+   * It carries its own `documentId` because this store outlives a document
+   * switch (the resource manager swaps `pageId` on a mounted PageEditor): a
+   * quote captured in one document must never be adopted by the next one's
+   * composer, or published against it.
+   */
+  pendingCommentAnchor?: PendingCommentAnchor;
+  /**
+   * Ticks every time a selection is captured. The store compares selected
+   * values by content, so two picks of the same run look identical to a
+   * subscriber; this counter is what tells them apart (the composer takes
+   * the caret again on every pick).
+   */
+  pendingCommentAnchorVersion: number;
   rightPanelMode: RightPanelMode;
 }
 
 export const initialState: State = {
   autoSave: true,
+  commentsPanelOpen: false,
   documentId: undefined,
   emoji: undefined,
   // Start pending (read-only) so the editor never flashes editable before the
@@ -80,6 +131,8 @@ export const initialState: State = {
   lockHolderOwnerId: null,
   lockOwnerId: undefined,
   metaSaveStatus: 'idle',
+  pendingCommentAnchor: undefined,
+  pendingCommentAnchorVersion: 0,
   rightPanelMode: 'copilot',
   title: undefined,
 };

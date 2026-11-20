@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { AgentDocumentModel } from '@/database/models/agentDocuments';
 import { ChunkModel } from '@/database/models/chunk';
 import { DocumentModel } from '@/database/models/document';
 import { FileModel } from '@/database/models/file';
@@ -13,6 +14,7 @@ import { createFtsSearchRepo } from '@/server/services/ftsSearch';
 import { DocumentService } from '../document';
 import { KnowledgeBaseSearchService } from './index';
 
+vi.mock('@/database/models/agentDocuments', () => ({ AgentDocumentModel: vi.fn() }));
 vi.mock('@/database/models/chunk', () => ({ ChunkModel: vi.fn() }));
 vi.mock('@/database/models/document', () => ({ DocumentModel: vi.fn() }));
 vi.mock('@/database/models/file', () => ({ FileModel: vi.fn() }));
@@ -28,6 +30,7 @@ vi.mock('@/database/utils/workspace', () => ({
 
 describe('KnowledgeBaseSearchService', () => {
   const userId = 'user_test';
+  let agentDocumentModelMock: any;
   let chunkModelMock: any;
   let documentModelMock: any;
   let fileModelMock: any;
@@ -39,6 +42,7 @@ describe('KnowledgeBaseSearchService', () => {
   beforeEach(() => {
     vi.clearAllMocks();
 
+    agentDocumentModelMock = { listRevokedFromAllAgents: vi.fn().mockResolvedValue([]) };
     chunkModelMock = { semanticSearchForChat: vi.fn() };
     documentModelMock = { findById: vi.fn(), findByFileId: vi.fn() };
     fileModelMock = { findById: vi.fn() };
@@ -50,6 +54,9 @@ describe('KnowledgeBaseSearchService', () => {
       },
     };
 
+    vi.mocked(AgentDocumentModel).mockImplementation(function () {
+      return agentDocumentModelMock;
+    });
     vi.mocked(ChunkModel).mockImplementation(function () {
       return chunkModelMock;
     });
@@ -88,6 +95,103 @@ describe('KnowledgeBaseSearchService', () => {
         metadata: { tag: 'note' },
       });
       expect(result[0].error).toBeUndefined();
+    });
+
+    describe('file-backed agent documents (uploaded into the Documents panel)', () => {
+      // `AgentDocumentsService.importFile` stores the bytes in `files` and writes an empty
+      // `documents` row pointing at them; only the original file holds the text.
+      const placeholder = {
+        content: '',
+        fileId: 'file_RievR3MzZrMG',
+        fileType: 'text/markdown',
+        filename: 'product-spec.md',
+        id: 'docs_sq6UdPi9clb74C4e',
+        metadata: null,
+        sourceType: 'file',
+        title: 'product-spec.md',
+        totalCharCount: 0,
+      };
+
+      it('reads docs_* through the underlying file instead of the empty placeholder', async () => {
+        documentModelMock.findById.mockResolvedValue(placeholder);
+        fileModelMock.findById.mockResolvedValue({
+          id: 'file_RievR3MzZrMG',
+          name: 'product-spec.md',
+        });
+        documentModelMock.findByFileId.mockResolvedValue(undefined);
+        documentServiceMock.parseFile.mockResolvedValue({
+          content: '# Product Spec\n\nShip the uploader.',
+          metadata: null,
+        });
+
+        const result = await service.getFileContents(['docs_sq6UdPi9clb74C4e']);
+
+        expect(fileModelMock.findById).toHaveBeenCalledWith('file_RievR3MzZrMG');
+        expect(documentServiceMock.parseFile).toHaveBeenCalledWith('file_RievR3MzZrMG');
+        expect(result[0]).toMatchObject({
+          content: '# Product Spec\n\nShip the uploader.',
+          fileId: 'docs_sq6UdPi9clb74C4e',
+          filename: 'product-spec.md',
+          totalCharCount: 34,
+        });
+        expect(result[0].error).toBeUndefined();
+      });
+
+      it('reuses an existing parse cache for the placeholder file', async () => {
+        documentModelMock.findById.mockResolvedValue(placeholder);
+        fileModelMock.findById.mockResolvedValue({
+          id: 'file_RievR3MzZrMG',
+          name: 'product-spec.md',
+        });
+        documentModelMock.findByFileId.mockResolvedValue({
+          content: 'cached parse',
+          metadata: null,
+        });
+
+        const result = await service.getFileContents(['docs_sq6UdPi9clb74C4e']);
+
+        expect(documentServiceMock.parseFile).not.toHaveBeenCalled();
+        expect(result[0]).toMatchObject({ content: 'cached parse', totalCharCount: 12 });
+      });
+
+      it('keeps reading an edited docs_* row that happens to reference a file', async () => {
+        documentModelMock.findById.mockResolvedValue({
+          ...placeholder,
+          content: 'hand-written notes',
+          fileType: 'custom/document',
+        });
+
+        const result = await service.getFileContents(['docs_sq6UdPi9clb74C4e']);
+
+        expect(fileModelMock.findById).not.toHaveBeenCalled();
+        expect(result[0].content).toBe('hand-written notes');
+      });
+    });
+
+    it('does not read back an agent document deleted from every agent', async () => {
+      documentModelMock.findById.mockResolvedValue({
+        content: 'STANDING RULE: reply with RULE-ACTIVE',
+        filename: 'rules.md',
+        id: 'docs_deleted',
+        title: 'rules',
+      });
+      agentDocumentModelMock.listRevokedFromAllAgents.mockResolvedValue(['docs_deleted']);
+
+      const result = await service.getFileContents(['docs_deleted']);
+
+      // One batched lookup for every docs_* id in the call.
+      expect(agentDocumentModelMock.listRevokedFromAllAgents).toHaveBeenCalledTimes(1);
+      expect(agentDocumentModelMock.listRevokedFromAllAgents).toHaveBeenCalledWith([
+        'docs_deleted',
+      ]);
+      expect(result).toEqual([
+        {
+          content: '',
+          error: 'Document not found',
+          fileId: 'docs_deleted',
+          filename: 'Unknown document docs_deleted',
+        },
+      ]);
     });
 
     it('returns "Document not found" when docs_* id is missing', async () => {

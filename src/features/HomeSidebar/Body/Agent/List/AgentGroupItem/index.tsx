@@ -1,9 +1,7 @@
 import { GROUP_CHAT_URL } from '@lobechat/const';
 import { type SidebarAgentItem } from '@lobechat/types';
-import { Flexbox, Icon } from '@lobehub/ui';
-import { ActionIcon, Tag } from '@lobehub/ui/base-ui';
-import { cssVar } from 'antd-style';
-import { Loader2, PinIcon } from 'lucide-react';
+import { ActionIcon, cssVar, Flexbox, Spin, Tag } from '@lobehub/ui';
+import { PinIcon } from 'lucide-react';
 import { type CSSProperties, type DragEvent } from 'react';
 import { memo, useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -14,7 +12,9 @@ import WorkspaceLink from '@/features/Workspace/WorkspaceLink';
 import { useGlobalStore } from '@/store/global';
 import { useHomeStore } from '@/store/home';
 
+import { useSidebarPinState } from '../../useSidebarPinState';
 import Actions from '../Item/Actions';
+import PrivateLockIcon from '../PrivateLockIcon';
 import { useGroupDropdownMenu } from './useDropdownMenu';
 
 interface GroupItemProps {
@@ -25,9 +25,11 @@ interface GroupItemProps {
 }
 
 const GroupItem = memo<GroupItemProps>(({ item, style, className, onNavigate }) => {
-  const { id, avatar, backgroundColor, description, title, pinned, userId } = item;
+  const { id, avatar, backgroundColor, description, title, pinned, userId, visibility } = item;
   const { t } = useTranslation('chat');
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
+  const { isMyPinned, isPrivate, isTeamPinned } = useSidebarPinState({ id, pinned, visibility });
+  const showPinIcon = isTeamPinned || isMyPinned;
 
   const openAgentInNewWindow = useGlobalStore((s) => s.openAgentInNewWindow);
 
@@ -72,19 +74,25 @@ const GroupItem = memo<GroupItemProps>(({ item, style, className, onNavigate }) 
     [id, openAgentInNewWindow],
   );
 
-  // Memoize pin icon
+  // The lock sits with the pin in the fixed trailing slot so a long title
+  // can't truncate it out of view.
   const pinIcon = useMemo(
     () =>
-      pinned ? (
-        <ActionIcon icon={PinIcon} size={12} style={{ opacity: 0.5, pointerEvents: 'none' }} />
+      showPinIcon || isPrivate ? (
+        <>
+          {isPrivate && <PrivateLockIcon />}
+          {showPinIcon && (
+            <ActionIcon icon={PinIcon} size={12} style={{ opacity: 0.5, pointerEvents: 'none' }} />
+          )}
+        </>
       ) : undefined,
-    [pinned],
+    [isPrivate, showPinIcon],
   );
 
   // Memoize avatar icon (show loader when updating)
   const avatarIcon = useMemo(() => {
     if (isUpdating) {
-      return <Icon spin color={cssVar.colorTextDescription} icon={Loader2} size={18} />;
+      return <Spin size="small" style={{ color: cssVar.colorTextDescription }} />;
     }
 
     // If avatar is a string, it's a custom group avatar
@@ -115,6 +123,7 @@ const GroupItem = memo<GroupItemProps>(({ item, style, className, onNavigate }) 
     pinned: pinned ?? false,
     title: displayTitle,
     userId,
+    visibility,
   });
 
   return (

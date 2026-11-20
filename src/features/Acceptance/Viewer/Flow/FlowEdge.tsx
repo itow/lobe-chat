@@ -1,40 +1,34 @@
-import { Button } from '@lobehub/ui/base-ui';
+import { cssVar } from '@lobehub/ui/stylex/cssVar.stylex';
+import * as stylex from '@stylexjs/stylex';
 import type { Edge, EdgeProps } from '@xyflow/react';
 import { BaseEdge, EdgeLabelRenderer, getSmoothStepPath } from '@xyflow/react';
-import { createStaticStyles, cssVar, cx } from 'antd-style';
 
 import { getFlowEdgeLabelLayout } from './flowEdgeLabel';
 
-const styles = createStaticStyles(({ css }) => ({
-  label: css`
-    pointer-events: all;
+const styles = stylex.create({
+  label: {
+    pointerEvents: 'none',
+    position: 'absolute',
+    overflow: 'hidden',
+    display: '-webkit-box',
+    WebkitBoxOrient: 'vertical',
+    WebkitLineClamp: '5',
+    maxWidth: '200px',
+    maxHeight: '94px',
+    paddingBlock: '5px',
+    paddingInline: '10px',
+    borderRadius: '8px',
+    fontSize: '12px',
+    lineHeight: '18px',
+    color: cssVar.colorTextSecondary,
+    overflowWrap: 'anywhere',
+    whiteSpace: 'normal',
+    backgroundColor: cssVar.colorBgContainer,
+    backgroundImage: `linear-gradient(${cssVar.colorFillQuaternary}, ${cssVar.colorFillQuaternary})`,
+  },
+});
 
-    position: absolute;
-
-    overflow: hidden;
-    display: -webkit-box;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-
-    max-width: 180px;
-    height: auto;
-    min-height: 0;
-    max-height: 42px;
-    padding-block: 3px;
-    padding-inline: 2px;
-    border-radius: 4px;
-
-    font-size: 12px;
-    line-height: 18px;
-    color: ${cssVar.colorTextSecondary};
-    overflow-wrap: anywhere;
-    white-space: normal;
-
-    background: ${cssVar.colorBgContainer};
-  `,
-}));
-
-type TransitionEdge = Edge<{ onSelect: (id: string) => void; laneOffset?: number }>;
+type TransitionEdge = Edge<{ laneOffset?: number }>;
 
 /** Labels share the graph scale so zooming out preserves their spacing. */
 export function FlowEdge(props: EdgeProps<TransitionEdge>) {
@@ -51,19 +45,15 @@ export function FlowEdge(props: EdgeProps<TransitionEdge>) {
     <>
       <BaseEdge id={props.id} markerEnd={props.markerEnd} path={path} style={props.style} />
       <EdgeLabelRenderer>
-        <Button
-          className={cx(styles.label, 'nodrag', 'nopan')}
-          size="small"
-          title={typeof props.label === 'string' ? props.label : undefined}
-          type="text"
+        <div
+          className={stylex.props(styles.label).className}
           style={{
             maxWidth: label.maxWidth,
             transform: `translate(-50%, -50%) translate(${label.x}px, ${label.y}px)`,
           }}
-          onClick={() => props.data?.onSelect(props.id)}
         >
           {props.label}
-        </Button>
+        </div>
       </EdgeLabelRenderer>
     </>
   );

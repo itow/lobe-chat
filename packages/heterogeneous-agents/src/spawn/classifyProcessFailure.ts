@@ -1,16 +1,15 @@
 import {
-  buildHeterogeneousAgentAuthRequiredError,
   buildHeterogeneousAgentCliNotFoundError,
   HETEROGENEOUS_AGENT_CONFIGS,
-  isHeterogeneousAgentAuthRequired,
   isLocalHeterogeneousType,
 } from '../config';
+import { classifyCliMessageError } from '../errors/classifyCliMessageError';
 import type { HeterogeneousTerminalErrorData } from '../types';
 
 /**
  * Process-level failure classification for `lh hetero exec` runs.
  *
- * The stream adapters (`adapters/claudeCode.ts`, `adapters/codex.ts`) classify
+ * The stream adapters (`adapters/claudeCode.ts`, `adapters/codex/`) classify
  * failures the CLI reports in-stream (overloaded / rate-limit / auth relayed
  * via a `result` event), but a run that dies BEFORE the agent CLI produces any
  * stream — `spawn claude ENOENT`, an auth failure printed straight to stderr —
@@ -19,9 +18,9 @@ import type { HeterogeneousTerminalErrorData } from '../types';
  * error card instead of the heterogeneous status guide (install CLI / sign in).
  *
  * This helper mirrors the desktop in-process classifier
- * (`HeterogeneousAgentCtr.getSessionErrorPayload`) for the two guide codes a
+ * (`HeterogeneousAgentCtr.getSessionErrorPayload`) for the guide codes a
  * process-level failure can produce: `cli_not_found`,
- * `working_directory_not_found`, and `auth_required`.
+ * `working_directory_not_found`, `rate_limit` and `auth_required`.
  * The returned shape is persisted verbatim as the `ChatMessageError.body`, so
  * it must carry `agentType` + `code` — that pair is what
  * `isHeterogeneousAgentStatusGuideError` gates the dedicated UI on.
@@ -119,11 +118,5 @@ export const classifyHeteroProcessFailure = (
     });
   }
 
-  if (detail && isHeterogeneousAgentAuthRequired(agentType, detail)) {
-    return buildHeterogeneousAgentAuthRequiredError({
-      agentType,
-      command,
-      stderr: detail,
-    });
-  }
+  return classifyCliMessageError({ agentType, command, detail });
 };

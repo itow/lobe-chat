@@ -1,3 +1,4 @@
+import { ERROR_CODE_SPECS, formatErrorRef } from '@lobechat/model-runtime/errors';
 import { describe, expect, it } from 'vitest';
 
 import type { RenderStepParams } from '../replyTemplate';
@@ -364,6 +365,71 @@ describe('replyTemplate', () => {
   // ==================== renderAgentError ====================
 
   describe('renderAgentError', () => {
+    it.each(Object.values(ERROR_CODE_SPECS).filter((spec) => !spec.isFallback))(
+      'renders actionable localized copy and a stable reference for $code',
+      (spec) => {
+        for (const locale of ['en-US', 'zh-CN'] as const) {
+          const output = renderAgentError(
+            spec.code,
+            'private upstream payload',
+            'op-known',
+            locale,
+          );
+          expect(output).toContain(formatErrorRef(spec.code));
+          expect(output).toContain('op-known');
+          expect(output).not.toContain('private upstream payload');
+          expect(output).not.toContain('{{');
+          expect(output.split('\n').length).toBeGreaterThanOrEqual(3);
+        }
+      },
+    );
+
+    it('renders a classified code without dedicated copy through its attribution fallback', () => {
+      const output = renderAgentError(
+        'RequestBodyTooLarge',
+        'secret upstream payload',
+        'op-size',
+        'en-US',
+        'harness',
+      );
+      expect(output).toContain('Error code: `E');
+      expect(output).toContain('op-size');
+      expect(output).not.toContain('Agent Execution Failed');
+      expect(output).not.toContain('secret upstream payload');
+    });
+
+    it('names the unreachable device instead of falling to the legacy tier', () => {
+      // A hetero dispatch failure (device offline / unregistered / no gateway)
+      // reaches the bot as `DeviceGatewayNotConfigured` with no attribution, so
+      // without its own mapping it rendered a bare "Agent Execution Failed".
+      const output = renderAgentError(
+        'DeviceGatewayNotConfigured',
+        '{"error":"DEVICE_NOT_FOUND","success":false}',
+        'op-device',
+      );
+      expect(output).toContain("Couldn't reach the device this agent runs on");
+      expect(output).toContain('op-device');
+      expect(output).not.toContain('Agent Execution Failed');
+      expect(output).not.toContain('DEVICE_NOT_FOUND');
+
+      const zh = renderAgentError('DeviceGatewayNotConfigured', undefined, 'op-device', 'zh-CN');
+      expect(zh).toContain('无法连接到运行该 Agent 的设备');
+      expect(zh).not.toContain('Agent 执行失败');
+    });
+
+    it('classifies a legacy envelope before choosing IM copy', () => {
+      const output = renderAgentError('ProviderBizError', 'insufficient quota', 'op-quota');
+      expect(output).toContain('Provider quota exhausted');
+      expect(output).toContain('Error code: `E');
+    });
+
+    it('renders a known request error in Chinese with a stable reference', () => {
+      const output = renderAgentError('RequestBodyTooLarge', undefined, 'op-size', 'zh-CN');
+      expect(output).toContain('错误码:');
+      expect(output).not.toContain('Something went wrong');
+      expect(output).not.toContain('RequestBodyTooLarge');
+    });
+
     it('returns the friendly NoAvailableProvider copy and appends the operation id footer', () => {
       const out = renderAgentError('NoAvailableProvider', undefined, 'op-abc');
       expect(out).toContain('No model provider configured');
@@ -402,7 +468,7 @@ describe('replyTemplate', () => {
 
     it('returns the friendly InsufficientBudgetForModel copy instead of the generic user fallback', () => {
       const en = renderAgentError('InsufficientBudgetForModel', undefined, 'op-1');
-      expect(en).toContain('Not enough credits');
+      expect(en).toContain('Not enough balance');
       expect(en).toContain('op-1');
       const zh = renderAgentError(
         'InsufficientBudgetForModel',
@@ -411,17 +477,17 @@ describe('replyTemplate', () => {
         'zh-CN',
         'user',
       );
-      expect(zh).toContain('积分余额不足');
+      expect(zh).toContain('余额不足');
       expect(zh).not.toContain('请检查你的输入');
     });
 
     // The admission gate emits one of three codes for the same "the allowance
     // can't cover this" outcome; the plan-limit pair used to fall to the `user`
-    // tier and tell the user to check their input (LOBE-13726).
+    // tier and tell the user to check their input.
     it('gives every budget-exhaustion code its own credits copy, not "check your input"', () => {
       const expected: Record<string, string> = {
         FreePlanLimit: 'Free plan limit reached',
-        InsufficientBudgetForModel: 'Not enough credits',
+        InsufficientBudgetForModel: 'Not enough balance',
         SubscriptionPlanLimit: 'Plan limit reached',
       };
 
@@ -450,7 +516,7 @@ describe('replyTemplate', () => {
       }
     });
 
-    // LOBE-13726: a workspace member's own allowance ran out and the reply told
+    // A workspace member's own allowance ran out and the reply told
     // them to top up — which does nothing for that allowance — while the numbers
     // that would have identified the real fault stayed in the trace.
     describe('budget scope', () => {
@@ -472,7 +538,7 @@ describe('replyTemplate', () => {
         );
 
         expect(en).toContain('Member budget in this workspace is used up');
-        expect(en).not.toContain('Not enough credits');
+        expect(en).not.toContain('Not enough balance');
         expect(en).toContain('Operation ID: `op-1`');
 
         const zh = renderAgentError(
@@ -485,7 +551,7 @@ describe('replyTemplate', () => {
         );
 
         expect(zh).toContain('该工作区的成员预算已用尽');
-        expect(zh).not.toContain('积分余额不足');
+        expect(zh).not.toContain('余额不足');
       });
 
       // The workspace gate throws SubscriptionPlanLimit (not
@@ -511,7 +577,7 @@ describe('replyTemplate', () => {
           { ...budget, budgetTypeAtError: 'workspace' },
         );
 
-        expect(en).toContain('Workspace credits exhausted');
+        expect(en).toContain('Workspace usage exhausted');
 
         const zh = renderAgentError(
           'InsufficientBudgetForModel',
@@ -531,14 +597,14 @@ describe('replyTemplate', () => {
             ...budget,
             budgetTypeAtError: 'some_new_scope',
           }),
-        ).toContain('Not enough credits');
+        ).toContain('Not enough balance');
 
         expect(
           renderAgentError('InsufficientBudgetForModel', undefined, 'op-1', 'en-US', 'user', {
             availableCredits: 12,
             requiredCredits: 34,
           }),
-        ).toContain('Not enough credits');
+        ).toContain('Not enough balance');
       });
 
       // Runs mentioned from a shared channel are billed to the bot owner, so the
@@ -563,12 +629,13 @@ describe('replyTemplate', () => {
       });
     });
 
-    it('maps both QuotaLimitReached and InsufficientQuota to the same quota copy', () => {
+    it('resolves the legacy rate-limit alias separately from exhausted quota', () => {
       const a = renderAgentError('QuotaLimitReached', undefined, 'op-1');
       const b = renderAgentError('InsufficientQuota', undefined, 'op-1');
-      expect(a).toContain('quota');
+      expect(a).toContain('Too many requests');
       expect(b).toContain('quota');
-      expect(a).toBe(b);
+      expect(a).toContain('E3001');
+      expect(b).toContain('E2001');
     });
 
     it('uses friendly copy for command connection close failures wrapped as 500 errors', () => {
@@ -620,7 +687,7 @@ describe('replyTemplate', () => {
         'en-US',
         'system',
       );
-      expect(en).toContain('temporary system error');
+      expect(en).toContain('A temporary system error occurred.');
       expect(en).not.toContain('model provider');
       expect(en).not.toMatch(/switch to a different model/i);
       expect(en).toContain('op-1');
@@ -632,7 +699,7 @@ describe('replyTemplate', () => {
         'zh-CN',
         'system',
       );
-      expect(zh).toContain('临时系统错误');
+      expect(zh).toContain('发生了临时系统错误');
     });
 
     it('still gives ProviderNetworkError the provider-specific network copy', () => {
@@ -681,11 +748,32 @@ describe('replyTemplate', () => {
       expect(zh).toContain('网络连接异常');
     });
 
+    it('treats a provider-closed stream as a transient network drop, not an internal error', () => {
+      const en = renderAgentError(
+        'ProviderStreamInterrupted',
+        'Stream ended unexpectedly',
+        'op-stream',
+      );
+      expect(en).toContain('Network error talking to the model provider');
+      expect(en).toContain('E6005');
+      expect(en).not.toContain('Something went wrong on our side');
+
+      const zh = renderAgentError(
+        'ProviderStreamInterrupted',
+        'Stream ended unexpectedly',
+        'op-stream',
+        'zh-CN',
+      );
+      expect(zh).toContain('网络连接异常');
+    });
+
     it('maps provider-capacity codes to the temporarily-unavailable copy', () => {
       const unavailable = renderAgentError('ProviderServiceUnavailable', undefined, 'op-1');
       const noChannel = renderAgentError('NoAvailableChannel', undefined, 'op-1');
       expect(unavailable).toContain('temporarily unavailable');
-      expect(unavailable).toBe(noChannel);
+      expect(noChannel).toContain('temporarily unavailable');
+      expect(unavailable).toContain('E3002');
+      expect(noChannel).toContain('E3003');
 
       expect(renderAgentError('RateLimitExceeded', undefined, 'op-1')).toContain(
         'Too many requests',
@@ -798,12 +886,19 @@ describe('replyTemplate', () => {
 
   describe('renderGroupRejected', () => {
     it('renders disabled and allowlist English copy', () => {
-      expect(renderGroupRejected('disabled')).toContain("doesn't respond in groups or channels");
+      const disabled = renderGroupRejected('disabled');
+      expect(disabled).toContain("don't have permission to talk to this bot");
+      // The owner can use the bot in groups, and DMs may be gated too — the
+      // notice must not claim the bot is silent in groups or redirect to DM.
+      // It also can't promise the owner can: the owner ID may be unset.
+      expect(disabled).not.toMatch(/doesn't respond|direct message/i);
       expect(renderGroupRejected('allowlist')).toContain("isn't enabled in this channel");
     });
 
     it('renders disabled and allowlist Chinese copy when locale is zh-CN', () => {
-      expect(renderGroupRejected('disabled', 'zh-CN')).toContain('不在群组或频道中响应');
+      const disabled = renderGroupRejected('disabled', 'zh-CN');
+      expect(disabled).toContain('没有在群组或频道中与该机器人对话的权限');
+      expect(disabled).not.toMatch(/不在群组|私信/);
       expect(renderGroupRejected('allowlist', 'zh-CN')).toContain('未在此频道启用');
     });
   });

@@ -45,10 +45,13 @@ import {
   toFeishuEmojiType,
 } from '@lobechat/chat-adapter-feishu';
 import { DEFAULT_BOT_HISTORY_LIMIT } from '@lobechat/const';
+import { TRPCError } from '@trpc/server';
 
 import type { MessageRuntimeService } from '@/server/services/toolExecution/serverRuntimes/message/adapters/types';
 import { PlatformUnsupportedError } from '@/server/services/toolExecution/serverRuntimes/message/PlatformUnsupportedError';
 
+import type { AttachmentSendResult } from '../attachmentDelivery';
+import { attachmentDeliveryState, warnAttachmentFailures } from '../attachmentDelivery';
 import { MAX_FEISHU_DOCUMENT_CHARS, MAX_FEISHU_HISTORY_LIMIT } from './const';
 import { sendFeishuAttachments } from './sendAttachments';
 
@@ -141,6 +144,32 @@ const explainDocumentReadError = (error: unknown): Error => {
 };
 
 /**
+ * `41050 no user authority error` from `/contact/v3/users/:id` means the user
+ * is outside the app's contacts permission scope, which the bot owner sets in
+ * their own developer console — not a server fault. Raised as a 4xx so it
+ * reaches the model as an actionable message instead of an opaque 500. The
+ * hint is model-facing tool output (no UI renders it), so it stays English and
+ * the model relays it in the user's language.
+ *
+ * @see https://open.feishu.cn/document/server-docs/contact-v3/user/get
+ */
+// Anchored on the code's position in `LarkApiClient`'s message (`failed: 400
+// {"code":41050,…}` or `failed: 41050 …`) so an open_id containing the digits
+// cannot match.
+const MEMBER_INFO_NO_AUTHORITY = /(?:"code":|failed: )41050\b/;
+
+const explainMemberInfoError = (error: unknown): Error => {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!MEMBER_INFO_NO_AUTHORITY.test(message))
+    return error instanceof Error ? error : new Error(message);
+  return new TRPCError({
+    cause: error,
+    code: 'PRECONDITION_FAILED',
+    message: `${message} — this user is outside the app's contacts permission scope. In the Feishu/Lark developer console, widen the app's contacts data range to include them (or all members), then create and publish a new app version for it to take effect. Users from another tenant cannot be looked up.`,
+  });
+};
+
+/**
  * What a `readDocument` call points at. A bare `documentId` is assumed to be
  * a docx token — that is what every other docx endpoint takes and what the
  * model gets back in `ReadDocumentState.documentId`.
@@ -193,13 +222,16 @@ export class FeishuMessageService implements MessageRuntimeService {
       const result = await this.api.sendMessage(params.channelId, params.content);
       messageId = result.messageId;
     }
+    let attachments: AttachmentSendResult | undefined;
     if (params.attachments?.length) {
-      await sendFeishuAttachments(this.api, params.channelId, params.attachments);
+      attachments = await sendFeishuAttachments(this.api, params.channelId, params.attachments);
+      warnAttachmentFailures(`bot-platform:${this.platformName}:sendMessage`, attachments.failures);
     }
     return {
       channelId: params.channelId,
       messageId,
       platform: this.platformName,
+      ...attachmentDeliveryState(attachments),
     };
   };
 
@@ -351,7 +383,9 @@ export class FeishuMessageService implements MessageRuntimeService {
   // ==================== Member Information ====================
 
   getMemberInfo = async (params: GetMemberInfoParams): Promise<GetMemberInfoState> => {
-    const user = await this.api.getUserInfo(params.memberId);
+    const user = await this.api.getUserInfo(params.memberId).catch((error) => {
+      throw explainMemberInfoError(error);
+    });
     return {
       displayName: user?.name ?? undefined,
       id: params.memberId,

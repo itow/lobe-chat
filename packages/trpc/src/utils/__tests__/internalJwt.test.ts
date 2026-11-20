@@ -60,10 +60,12 @@ const buildSignJWTChain = () => {
 };
 
 const SignJWTMock = vi.fn();
+const createLocalJWKSetMock = vi.fn().mockReturnValue('mock-key-set');
 const importJWKMock = vi.fn().mockResolvedValue('mock-crypto-key');
 
 vi.mock('jose', () => ({
   SignJWT: SignJWTMock,
+  createLocalJWKSet: (...args: unknown[]) => createLocalJWKSetMock(...args),
   importJWK: (...args: unknown[]) => importJWKMock(...args),
   jwtVerify: vi.fn(),
 }));
@@ -217,6 +219,22 @@ describe('internalJwt', () => {
     it('accepts the typed operation contract', async () => {
       const { validateHeteroOperationClaims } = await import('../internalJwt');
       expect(validateHeteroOperationClaims(validClaims)).toEqual(validClaims);
+    });
+
+    it('accepts the goal capability dispatched runs carry for /goal', async () => {
+      const { validateHeteroOperationClaims } = await import('../internalJwt');
+      const claims = {
+        ...validClaims,
+        capabilities: ['hetero:ingest', 'hetero:finish', 'hetero:intervention:read', 'goal:manage'],
+      };
+      expect(validateHeteroOperationClaims(claims)).toEqual(claims);
+    });
+
+    it('rejects a capability it does not know', async () => {
+      const { validateHeteroOperationClaims } = await import('../internalJwt');
+      expect(
+        validateHeteroOperationClaims({ ...validClaims, capabilities: ['goal:delete'] }),
+      ).toBeNull();
     });
 
     it.each(['aud', 'iss', 'purpose', 'operation_id', 'capabilities'])(

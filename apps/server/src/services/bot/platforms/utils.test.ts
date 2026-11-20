@@ -9,6 +9,7 @@ import {
   resolveBotConcurrency,
   resolveBotProviderConfig,
   resolveConnectionMode,
+  restrictPlatformToWebhook,
   withResolvedConcurrencySettings,
 } from './utils';
 
@@ -58,8 +59,13 @@ describe('formatDuration', () => {
   });
 
   it('should format minutes and seconds', () => {
-    expect(formatDuration(65_000)).toBe('1m5s');
-    expect(formatDuration(120_000)).toBe('2m0s');
+    expect(formatDuration(65_000)).toBe('1m 5s');
+    expect(formatDuration(120_000)).toBe('2m 0s');
+  });
+
+  it('should roll long runs up into hours and days', () => {
+    expect(formatDuration(3_723_000)).toBe('1h 2m');
+    expect(formatDuration(90_000_000)).toBe('1d 1h 0m');
   });
 });
 
@@ -141,6 +147,52 @@ describe('resolveConnectionMode', () => {
   it('falls back to webhook when platform definition is missing', () => {
     expect(resolveConnectionMode(undefined, null)).toBe('webhook');
     expect(resolveConnectionMode(undefined, { connectionMode: 'websocket' })).toBe('websocket');
+  });
+});
+
+describe('restrictPlatformToWebhook', () => {
+  const platform = {
+    connectionMode: 'websocket',
+    schema: [
+      {
+        key: 'settings',
+        properties: [
+          {
+            default: 'websocket',
+            enum: ['websocket', 'webhook'],
+            enumDescriptions: ['ws hint', 'webhook hint'],
+            enumLabels: ['WebSocket', 'Webhook'],
+            key: 'connectionMode',
+          },
+          { default: 5, key: 'charLimit' },
+        ],
+      },
+      { key: 'credentials' },
+    ],
+  } as unknown as Pick<PlatformDefinition, 'connectionMode' | 'schema'>;
+
+  it('offers webhook as the default and only mode, keeping labels aligned', () => {
+    const restricted = restrictPlatformToWebhook(platform);
+
+    expect(restricted.connectionMode).toBe('webhook');
+    expect(restricted.schema[0].properties).toEqual([
+      {
+        default: 'webhook',
+        enum: ['webhook'],
+        enumDescriptions: ['webhook hint'],
+        enumLabels: ['Webhook'],
+        key: 'connectionMode',
+      },
+      { default: 5, key: 'charLimit' },
+    ]);
+    expect(restricted.schema[1]).toEqual({ key: 'credentials' });
+  });
+
+  it('does not mutate the shared registry definition', () => {
+    restrictPlatformToWebhook(platform);
+
+    expect(platform.connectionMode).toBe('websocket');
+    expect(platform.schema[0].properties?.[0].default).toBe('websocket');
   });
 });
 

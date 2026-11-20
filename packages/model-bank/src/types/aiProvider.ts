@@ -1,6 +1,11 @@
 import { z } from 'zod';
 
-import type { AiModelForSelect, EnabledAiModel, ModelSearchImplementType } from './aiModel';
+import type {
+  AiModelForSelect,
+  AiModelReasoningConfig,
+  EnabledAiModel,
+  ModelSearchImplementType,
+} from './aiModel';
 
 export type ResponseAnimationStyle = 'smooth' | 'fadeIn' | 'none';
 export type ResponseAnimation =
@@ -144,6 +149,13 @@ export interface AiProviderSettings {
    */
   authType?: AiProviderAuthType;
   /**
+   * How the connectivity checker verifies the provider.
+   * - `chat` (default): sends a chat message to the selected check model.
+   * - `credentials`: asks the provider runtime to verify the key without a model
+   *   (e.g. a balance endpoint), for providers that serve no chat models.
+   */
+  checkMode?: 'chat' | 'credentials';
+  /**
    * whether provider show browser request option by default
    *
    * @default false
@@ -227,8 +239,9 @@ const OAuthDeviceFlowConfigSchema = z.object({
   tokenExchangeEndpoint: z.string().optional(),
 });
 
-const AiProviderSettingsSchema = z.object({
+export const AiProviderSettingsSchema = z.object({
   authType: z.enum(AiProviderAuthTypes).optional(),
+  checkMode: z.enum(['chat', 'credentials']).optional(),
   defaultShowBrowserRequest: z.boolean().optional(),
   disableBrowserRequest: z.boolean().optional(),
   maxToolCount: z.number().optional(),
@@ -346,6 +359,12 @@ export interface AiProviderDetailItem {
    * the default model that used for connection check
    */
   checkModel?: string;
+  /**
+   * provider-level behaviour switches persisted on `ai_providers.config`
+   * (e.g. `enableResponseApi`). The detail query already selects the column,
+   * the field was missing from this type.
+   */
+  config?: AiProviderConfig;
   description?: string;
   enabled: boolean;
   fetchOnClient?: boolean;
@@ -436,6 +455,12 @@ export interface AiProviderRuntimeState {
   hiddenBuiltinModels?: BuiltinModelIdentifier[];
   /** False when the server could not resolve the current user's hidden-model policy. */
   hiddenBuiltinModelsResolved?: boolean;
+  /**
+   * The user's saved per-model reasoning defaults (personal scope, shared across
+   * workspaces), keyed by `${providerId}/${modelId}`. When present it is
+   * complete: a missing key means nothing is saved for that model.
+   */
+  modelReasoningConfigs?: Record<string, AiModelReasoningConfig>;
   /**
    * Retired `${providerId}/${modelId}` → successor model id (same provider).
    * Requests for a key are transparently served by its successor, so clients can

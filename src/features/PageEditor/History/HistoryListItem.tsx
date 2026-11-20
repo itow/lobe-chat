@@ -1,9 +1,6 @@
 'use client';
 
-import { Flexbox } from '@lobehub/ui';
-import { ActionIcon, Tag } from '@lobehub/ui/base-ui';
-import { Tooltip } from 'antd';
-import { createStaticStyles, cssVar, cx } from 'antd-style';
+import { ActionIcon, createStaticStyles, cssVar, cx, Flexbox, Tag, Tooltip } from '@lobehub/ui';
 import dayjs from 'dayjs';
 import { ArrowLeftRightIcon, RotateCcwIcon } from 'lucide-react';
 import type { MouseEvent } from 'react';
@@ -11,6 +8,8 @@ import { memo } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { useAuthorInfo } from '@/business/client/hooks/useAuthorInfo';
+import { useFetchWorkspaceMembers } from '@/business/client/hooks/useFetchWorkspaceMembers';
+import MemberProfilePopup from '@/features/MemberProfileCard/MemberProfilePopup';
 import { useEventCallback } from '@/hooks/useEventCallback';
 import type { DocumentHistorySaveSource } from '@/server/routers/lambda/_schema/documentHistory';
 
@@ -143,6 +142,7 @@ export const HistoryListItem = memo<HistoryListItemProps>(({ historyId, onCompar
   const item = useHistoryItemsStore(historyItemSelectors.itemById(historyId));
   const isRestoring = useHistoryItemsStore(historyItemSelectors.isRestoring(historyId));
   const authorInfo = useAuthorInfo(item?.userId);
+  useFetchWorkspaceMembers({ enabled: !!item?.userId });
 
   const handleCompare = useEventCallback(() => {
     onCompare(historyId);
@@ -173,7 +173,14 @@ export const HistoryListItem = memo<HistoryListItemProps>(({ historyId, onCompar
           </span>
         </Tooltip>
         <span className={styles.description}>
-          {authorInfo?.fullName ? `${authorInfo.fullName} · ` : ''}
+          {authorInfo?.fullName && (
+            <>
+              <MemberProfilePopup placement={'left'} userId={item.userId}>
+                {authorInfo.fullName}
+              </MemberProfilePopup>
+              {' · '}
+            </>
+          )}
           {dayjs(item.savedAt).fromNow()}
         </span>
       </Flexbox>

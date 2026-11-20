@@ -3,6 +3,8 @@ import { ComputerRuntime } from '@lobechat/tool-runtime';
 import type { BuiltinServerRuntimeOutput } from '@lobechat/types';
 
 import type {
+  AnalyzeStorageParams,
+  DeleteFilesParams,
   ExecuteCodeParams,
   ExecuteCodeState,
   ExportFileParams,
@@ -10,6 +12,9 @@ import type {
   ISandboxService,
   SandboxCallToolResult,
 } from '../types';
+
+const stringify = (value: unknown) =>
+  typeof value === 'string' ? value : JSON.stringify(value ?? null);
 
 /**
  * Cloud Sandbox Execution Runtime
@@ -59,11 +64,18 @@ export class CloudSandboxExecutionRuntime extends ComputerRuntime {
       if (!result.success) {
         return {
           content: formatSandboxRecreation(
-            result.error?.message || JSON.stringify(result.error),
+            result.error?.message || 'Failed to execute code in sandbox',
             result.sessionExpiredAndRecreated,
           ),
+          // Execution may have completed before its response failed. Preserve
+          // diagnostics without automatically replaying arbitrary code.
+          error: {
+            ...result.error,
+            kind: 'stop',
+            message: result.error?.message || 'Failed to execute code in sandbox',
+          },
           state,
-          success: true,
+          success: false,
         };
       }
 
@@ -79,6 +91,58 @@ export class CloudSandboxExecutionRuntime extends ComputerRuntime {
       console.error('executeCode error', error);
       return this.handleError(error);
     }
+  }
+
+  // ==================== Cloud-Specific: Drive Space ====================
+
+  /**
+   * What takes up the persistent drive, by category, with the largest items.
+   * Answered by the storage service off the volume — no command runs — so it
+   * works on a drive over its quota, where every shell command is refused.
+   */
+  async analyzeStorage(args: AnalyzeStorageParams = {}): Promise<BuiltinServerRuntimeOutput> {
+    try {
+      // Capped so the listing stays a reasonable share of the model's context.
+      const top = typeof args.top === 'number' ? Math.min(Math.max(1, args.top), 50) : undefined;
+      const result = await this.callService('analyzeStorage', { top });
+      if (!result.success) return this.serviceFailure(result, 'Failed to analyze the drive', true);
+
+      return { content: stringify(result.result), state: result.result, success: true };
+    } catch (error) {
+      return this.handleError(error, true);
+    }
+  }
+
+  /**
+   * Delete files or folders on the persistent drive for good, past the quota.
+   * Whether the user is asked first is the manifest's dynamic audit; the
+   * storage service enforces `regenerableOnly` on the volume itself.
+   */
+  async deleteFiles(args: DeleteFilesParams): Promise<BuiltinServerRuntimeOutput> {
+    try {
+      const result = await this.callService('deleteFiles', {
+        paths: args.paths,
+        regenerableOnly: args.regenerableOnly === true,
+      });
+      if (!result.success) return this.serviceFailure(result, 'Failed to delete the files');
+
+      return { content: stringify(result.result), state: result.result, success: true };
+    } catch (error) {
+      return this.handleError(error);
+    }
+  }
+
+  private serviceFailure(
+    result: SandboxCallToolResult,
+    fallback: string,
+    retrySafe = false,
+  ): BuiltinServerRuntimeOutput {
+    const message = result.error?.message || fallback;
+    return {
+      content: message,
+      error: { ...result.error, kind: retrySafe ? undefined : 'stop', message },
+      success: false,
+    };
   }
 
   // ==================== Cloud-Specific: File Export ====================
@@ -109,8 +173,14 @@ export class CloudSandboxExecutionRuntime extends ComputerRuntime {
             filename,
             success: false,
           }),
+          // Upload or registration may already have succeeded before the error.
+          error: {
+            ...result.error,
+            kind: 'stop',
+            message: result.error?.message || 'Failed to export file from sandbox',
+          },
           state,
-          success: true,
+          success: false,
         };
       }
 

@@ -19,12 +19,14 @@ const mocks = vi.hoisted(() => ({
     taskDetailMap: {
       'T-parent': {
         agentId: 'agt_parent',
+        id: 'T-parent',
         identifier: 'T-parent',
         instruction: 'Parent instruction',
         status: 'running',
         subtasks: [
           {
             assignee: { avatar: null, backgroundColor: null, id: 'agt_child', title: 'Child' },
+            id: 'T-child',
             identifier: 'T-child',
             name: 'Child task',
             status: 'backlog',
@@ -35,6 +37,8 @@ const mocks = vi.hoisted(() => ({
   } as any,
 }));
 
+const locationMock = vi.hoisted(() => ({ state: undefined as unknown }));
+
 vi.mock('@/libs/contextMenu', () => ({
   showContextMenu: mocks.showContextMenu,
 }));
@@ -42,6 +46,54 @@ vi.mock('@/libs/contextMenu', () => ({
 vi.mock('@/business/client/hooks/useActiveWorkspaceId', () => ({
   useActiveWorkspaceId: () => mocks.activeWorkspaceId,
 }));
+
+vi.mock('@lobehub/ui', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  const factories: ((original: typeof importOriginal) => unknown)[] = [
+    async (importOriginal) => ({
+      ...(await importOriginal<object>()),
+      Tree: ({
+        onRightClick,
+        onSelect,
+        treeData,
+      }: {
+        onRightClick?: (info: { event: unknown; node: { key: string } }) => void;
+        onSelect?: (keys: string[]) => void;
+        treeData?: Array<{ key: string; title: ReactNode }>;
+      }) => (
+        <div>
+          {treeData?.map((node) => (
+            <button
+              data-testid="subtask-tree-node"
+              key={node.key}
+              type="button"
+              onClick={() => onSelect?.([node.key])}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                onRightClick?.({ event, node: { key: node.key } });
+              }}
+            >
+              {node.title}
+            </button>
+          ))}
+        </div>
+      ),
+    }),
+    async (importOriginal) => ({
+      ...(await importOriginal<object>()),
+      cssVar: {
+        colorTextDescription: '#999',
+        colorTextSecondary: '#666',
+      },
+    }),
+  ];
+  const merged: Record<string, unknown> = { ...actual };
+  for (const factory of factories) {
+    const part = (await factory(importOriginal)) as Record<string, unknown>;
+    for (const [key, value] of Object.entries(part)) if (value !== actual[key]) merged[key] = value;
+  }
+  return merged;
+});
 
 vi.mock('antd', async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -51,44 +103,10 @@ vi.mock('antd', async (importOriginal) => ({
       modal: { confirm: vi.fn() },
     }),
   },
-  ConfigProvider: ({ children }: { children: ReactNode }) => <>{children}</>,
-  Tree: ({
-    onRightClick,
-    onSelect,
-    treeData,
-  }: {
-    onRightClick?: (info: { event: unknown; node: { key: string } }) => void;
-    onSelect?: (keys: string[]) => void;
-    treeData?: Array<{ key: string; title: ReactNode }>;
-  }) => (
-    <div>
-      {treeData?.map((node) => (
-        <button
-          data-testid="subtask-tree-node"
-          key={node.key}
-          type="button"
-          onClick={() => onSelect?.([node.key])}
-          onContextMenu={(event) => {
-            event.preventDefault();
-            onRightClick?.({ event, node: { key: node.key } });
-          }}
-        >
-          {node.title}
-        </button>
-      ))}
-    </div>
-  ),
-}));
-
-vi.mock('antd-style', async (importOriginal) => ({
-  ...(await importOriginal<object>()),
-  cssVar: {
-    colorTextDescription: '#999',
-    colorTextSecondary: '#666',
-  },
 }));
 
 vi.mock('react-router', () => ({
+  useLocation: () => ({ state: locationMock.state }),
   useNavigate: () => mocks.navigate,
 }));
 
@@ -156,7 +174,7 @@ vi.mock('../shared/AccordionArrowIcon', () => ({
 }));
 
 vi.mock('../shared/style', () => ({
-  styles: { subtaskTree: 'subtask-tree' },
+  styles: { subtaskTreeTitle: 'subtask-tree-title' },
 }));
 
 vi.mock('./RunSubtasksPreview', () => ({
@@ -169,6 +187,7 @@ vi.mock('./TopicStatusIcon', () => ({
 
 describe('TaskSubtasks', () => {
   beforeEach(() => {
+    locationMock.state = undefined;
     mocks.activeWorkspaceId = 'workspace-1';
     mocks.buildContextMenuItems.mockClear();
     mocks.installKeyboardHandlers.mockClear();
@@ -177,6 +196,7 @@ describe('TaskSubtasks', () => {
     mocks.taskState.taskDetailMap['T-parent'].subtasks = [
       {
         assignee: { avatar: null, backgroundColor: null, id: 'agt_child', title: 'Child' },
+        id: 'T-child',
         identifier: 'T-child',
         name: 'Child task',
         status: 'backlog',
@@ -193,7 +213,9 @@ describe('TaskSubtasks', () => {
 
     fireEvent.click(screen.getByTestId('subtask-tree-node'));
 
-    expect(mocks.navigate).toHaveBeenCalledWith('/agent/agt_child/task/T-child');
+    expect(mocks.navigate).toHaveBeenCalledWith('/agent/agt_child/task/T-child/child-task', {
+      state: undefined,
+    });
   });
 
   it('routes right-click on a subtask through @/libs/contextMenu', () => {
@@ -208,6 +230,7 @@ describe('TaskSubtasks', () => {
     mocks.taskState.taskDetailMap['T-parent'].subtasks = [
       {
         assigneeUserId: 'member-1',
+        id: 'T-child',
         identifier: 'T-child',
         name: 'Child task',
         status: 'backlog',
@@ -219,6 +242,7 @@ describe('TaskSubtasks', () => {
 
     const expectedTarget = expect.objectContaining({
       assigneeUserId: 'member-1',
+      id: 'T-child',
       identifier: 'T-child',
     });
     expect(mocks.buildContextMenuItems).toHaveBeenCalledWith(expectedTarget);
@@ -230,6 +254,7 @@ describe('TaskSubtasks', () => {
       {
         assigneeUserId: 'member-1',
         automationMode: 'schedule',
+        id: 'T-child',
         identifier: 'T-child',
         name: 'Scheduled child task',
         status: 'scheduled',
@@ -246,6 +271,7 @@ describe('TaskSubtasks', () => {
     mocks.taskState.taskDetailMap['T-parent'].subtasks = [
       {
         assigneeUserId: 'member-1',
+        id: 'T-child',
         identifier: 'T-child',
         name: 'Child task',
         status: 'backlog',
@@ -260,6 +286,7 @@ describe('TaskSubtasks', () => {
   it('falls back to the global task route when the selected subtask has no assignee', () => {
     mocks.taskState.taskDetailMap['T-parent'].subtasks = [
       {
+        id: 'T-child',
         identifier: 'T-child',
         name: 'Child task',
         status: 'backlog',
@@ -270,13 +297,14 @@ describe('TaskSubtasks', () => {
 
     fireEvent.click(screen.getByTestId('subtask-tree-node'));
 
-    expect(mocks.navigate).toHaveBeenCalledWith('/task/T-child');
+    expect(mocks.navigate).toHaveBeenCalledWith('/task/T-child/child-task', { state: undefined });
   });
 
   it('uses the running topic status icon when a subtask has an active topic run', () => {
     mocks.taskState.taskDetailMap['T-parent'].subtasks = [
       {
         assignee: { avatar: null, backgroundColor: null, id: 'agt_child', title: 'Child' },
+        id: 'T-child',
         identifier: 'T-child',
         name: 'Child task',
         runningTopic: { id: 'topic-running', operationId: 'op-running' },
@@ -287,5 +315,16 @@ describe('TaskSubtasks', () => {
     render(<TaskSubtasks />);
 
     expect(screen.getByTestId('topic-status-icon')).toBeTruthy();
+  });
+
+  it('keeps carrying the source task list into a subtask', () => {
+    locationMock.state = { taskListOrigin: '/tasks?collection=mine' };
+    render(<TaskSubtasks />);
+
+    fireEvent.click(screen.getByTestId('subtask-tree-node'));
+
+    expect(mocks.navigate).toHaveBeenCalledWith('/agent/agt_child/task/T-child/child-task', {
+      state: { taskListOrigin: '/tasks?collection=mine' },
+    });
   });
 });

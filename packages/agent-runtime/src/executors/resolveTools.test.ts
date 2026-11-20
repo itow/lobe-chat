@@ -2,7 +2,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AgentRuntimeHost } from '../transport';
 import type { AgentInstruction, AgentState } from '../types';
+import { finish } from './finish';
 import { resolveAbortedTools, resolveBlockedTools } from './resolveTools';
+
+const createBlockedInstruction = (
+  toolCall: ReturnType<typeof createToolCall>,
+): Extract<AgentInstruction, { type: 'resolve_blocked_tools' }> => ({
+  payload: {
+    parentMessageId: 'assistant-msg-1',
+    toolsCalling: [toolCall],
+  },
+  type: 'resolve_blocked_tools',
+});
 
 const createState = (overrides?: Partial<AgentState>): AgentState => ({
   cost: {
@@ -16,7 +27,7 @@ const createState = (overrides?: Partial<AgentState>): AgentState => ({
   lastModified: '2026-07-07T00:00:00.000Z',
   maxSteps: 100,
   messages: [],
-  metadata: {
+  origin: {
     agentId: 'agent-1',
     threadId: 'thread-1',
     topicId: 'topic-1',
@@ -98,14 +109,24 @@ describe('resolveTools executors', () => {
     } as unknown as AgentRuntimeHost;
   });
 
+  it.each([undefined, false, true])(
+    'includes finish state only when the run opts in (%s)',
+    async (includeFinalState) => {
+      const state = createState({ host: { includeFinalState } });
+      const result = await finish(host)({ type: 'finish', reason: 'completed' }, state);
+      const event = publishEvent.mock.calls[0][0];
+      expect(event.data.finalState !== undefined).toBe(includeFinalState === true);
+      if (includeFinalState) expect(event.data.finalState.status).toBe('done');
+      expect(result.newState.status).toBe('done');
+      expect(result.events).toContainEqual(
+        expect.objectContaining({ type: 'done', finalState: result.newState }),
+      );
+    },
+  );
+
   it('persists blocked tools as rejected tool messages and continues', async () => {
-    const instruction: Extract<AgentInstruction, { type: 'resolve_blocked_tools' }> = {
-      payload: {
-        parentMessageId: 'assistant-msg-1',
-        toolsCalling: [createToolCall()],
-      },
-      type: 'resolve_blocked_tools',
-    };
+    const instruction: Extract<AgentInstruction, { type: 'resolve_blocked_tools' }> =
+      createBlockedInstruction(createToolCall());
 
     const result = await resolveBlockedTools(host)(instruction, createState());
 
@@ -143,6 +164,161 @@ describe('resolveTools executors', () => {
     expect(result.newState.messages).toContainEqual(
       expect.objectContaining({ id: 'tool-msg-1', role: 'tool' }),
     );
+  });
+
+  it('writes the per-call blocked content when one is given for the call id', async () => {
+    const instruction: Extract<AgentInstruction, { type: 'resolve_blocked_tools' }> = {
+      payload: {
+        blockedContent: 'generic rejection',
+        blockedContentByCallId: { 'tool-call-1': 'rejection naming tool-call-1' },
+        blockedReason: 'tool_arguments_empty',
+        parentMessageId: 'assistant-msg-1',
+        toolsCalling: [createToolCall()],
+      },
+      type: 'resolve_blocked_tools',
+    };
+
+    const result = await resolveBlockedTools(host)(instruction, createState());
+
+    expect(host.transports.messages.createToolMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ content: 'rejection naming tool-call-1' }),
+    );
+    expect(result.newState.messages).toContainEqual(
+      expect.objectContaining({ content: 'rejection naming tool-call-1', role: 'tool' }),
+    );
+  });
+
+  // Without this write the rejection is lost: state messages are rebuilt from
+  // the DB every step, and conversation-flow only collects a tool row whose
+  // parent assistant lists the matching call.
+  it('advertises unresolvable calls on the parent assistant and counts the round', async () => {
+    const instruction: Extract<AgentInstruction, { type: 'resolve_blocked_tools' }> = {
+      payload: {
+        blockedContent: 'Tool call rejected: no available tool is named searchh.',
+        blockedReason: 'tool_name_unresolved',
+        parentMessageId: 'assistant-msg-1',
+        toolsCalling: [createToolCall()],
+        unresolvedToolNames: true,
+      },
+      type: 'resolve_blocked_tools',
+    };
+
+    const result = await resolveBlockedTools(host)(instruction, createState());
+
+    expect(host.transports.messages.update).toHaveBeenCalledWith('assistant-msg-1', {
+      tools: [createToolCall()],
+    });
+    expect(result.newState.unresolvedToolFeedbackRounds).toBe(1);
+  });
+
+  it('accumulates unresolvable rounds across steps of one operation', async () => {
+    const instruction: Extract<AgentInstruction, { type: 'resolve_blocked_tools' }> = {
+      payload: {
+        parentMessageId: 'assistant-msg-1',
+        toolsCalling: [createToolCall()],
+        unresolvedToolNames: true,
+      },
+      type: 'resolve_blocked_tools',
+    };
+
+    const result = await resolveBlockedTools(host)(
+      instruction,
+      createState({ unresolvedToolFeedbackRounds: 1 }),
+    );
+
+    expect(result.newState.unresolvedToolFeedbackRounds).toBe(2);
+  });
+
+  describe('stop note on the parent reply', () => {
+    const stopInstruction: Extract<AgentInstruction, { type: 'resolve_blocked_tools' }> = {
+      payload: {
+        parentMessageId: 'assistant-msg-1',
+        parentNote: 'Stopped after 3 consecutive replies called tools that do not exist.',
+        toolsCalling: [createToolCall()],
+        unresolvedToolNames: true,
+      },
+      type: 'resolve_blocked_tools',
+    };
+
+    it('appends the note to the text the reply already has', async () => {
+      host.transports.messages.findById = vi
+        .fn()
+        .mockResolvedValue({ content: 'Running the script now.', id: 'assistant-msg-1' });
+
+      await resolveBlockedTools(host)(stopInstruction, createState());
+
+      expect(host.transports.messages.update).toHaveBeenCalledWith('assistant-msg-1', {
+        content:
+          'Running the script now.\n\nStopped after 3 consecutive replies called tools that do not exist.',
+        tools: [createToolCall()],
+      });
+    });
+
+    // The completion lifecycle reads the final assistant text from the runtime
+    // state and only recovers the row when that text is empty, so a reply that
+    // already carried text must carry the note in state as well.
+    it('mirrors the note into the runtime state reply', async () => {
+      host.transports.messages.findById = vi
+        .fn()
+        .mockResolvedValue({ content: 'Running the script now.', id: 'assistant-msg-1' });
+
+      const result = await resolveBlockedTools(host)(
+        stopInstruction,
+        createState({
+          messages: [
+            { content: 'Running the script now.', id: 'assistant-msg-1', role: 'assistant' },
+          ],
+        }),
+      );
+
+      const reply = result.newState.messages.find((message) => message.id === 'assistant-msg-1');
+      expect(reply?.content).toBe(
+        'Running the script now.\n\nStopped after 3 consecutive replies called tools that do not exist.',
+      );
+    });
+
+    // Image replies store serialized content parts; overwriting them with
+    // text would drop the images.
+    it('leaves a multimodal reply content alone', async () => {
+      host.transports.messages.findById = vi.fn().mockResolvedValue({
+        content: '[{"type":"image"}]',
+        id: 'assistant-msg-1',
+        metadata: { isMultimodal: true },
+      });
+
+      await resolveBlockedTools(host)(stopInstruction, createState());
+
+      expect(host.transports.messages.update).toHaveBeenCalledWith('assistant-msg-1', {
+        tools: [createToolCall()],
+      });
+    });
+  });
+
+  it('leaves the parent untouched for ordinary blocked tools', async () => {
+    const instruction: Extract<AgentInstruction, { type: 'resolve_blocked_tools' }> =
+      createBlockedInstruction(createToolCall());
+
+    const result = await resolveBlockedTools(host)(instruction, createState());
+
+    expect(host.transports.messages.update).not.toHaveBeenCalled();
+    expect(result.newState.unresolvedToolFeedbackRounds).toBeUndefined();
+  });
+
+  it('fails loudly when the parent assistant cannot be updated', async () => {
+    const failure = new Error('db down');
+    host.transports.messages.update = vi.fn().mockRejectedValue(failure);
+
+    const instruction: Extract<AgentInstruction, { type: 'resolve_blocked_tools' }> = {
+      payload: {
+        parentMessageId: 'assistant-msg-1',
+        toolsCalling: [createToolCall()],
+        unresolvedToolNames: true,
+      },
+      type: 'resolve_blocked_tools',
+    };
+
+    await expect(resolveBlockedTools(host)(instruction, createState())).rejects.toThrow('db down');
+    expect(createToolMessage).not.toHaveBeenCalled();
   });
 
   it('persists a caller-provided blocked reason and content', async () => {
@@ -278,13 +454,8 @@ describe('resolveTools executors', () => {
     const error = new Error('database went away');
     createToolMessage.mockRejectedValueOnce(error);
 
-    const instruction: Extract<AgentInstruction, { type: 'resolve_blocked_tools' }> = {
-      payload: {
-        parentMessageId: 'assistant-msg-1',
-        toolsCalling: [createToolCall()],
-      },
-      type: 'resolve_blocked_tools',
-    };
+    const instruction: Extract<AgentInstruction, { type: 'resolve_blocked_tools' }> =
+      createBlockedInstruction(createToolCall());
 
     await expect(resolveBlockedTools(host)(instruction, createState())).rejects.toThrow(
       'database went away',
